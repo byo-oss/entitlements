@@ -1,0 +1,130 @@
+{
+  "name": "@byo-oss/entitlements",
+  "version": "0.1.0",
+  "description": "A better-auth plugin for plan entitlements: features, limits and usage per organization, in your own database.",
+  "license": "MIT",
+  "author": "Jarod Stewart",
+  "type": "module",
+  "packageManager": "pnpm@12.14.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./catalog": {
+      "types": "./dist/catalog.d.ts",
+      "import": "./dist/catalog.js",
+      "require": "./dist/catalog.cjs"
+    },
+    "./client": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js",
+      "require": "./dist/client.cjs"
+    },
+    "./react": {
+      "types": "./dist/react/index.d.ts",
+      "import": "./dist/react/index.js",
+      "require": "./dist/react/index.cjs"
+    },
+    "./stripe": {
+      "types": "./dist/stripe/index.d.ts",
+      "import": "./dist/stripe/index.js",
+      "require": "./dist/stripe/index.cjs"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js"
+    }
+  },
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE.md",
+    "llms.txt",
+    "skills"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsup",
+    "test": "vitest run",
+    "test:sql": "vitest run --config vitest.sql.config.ts",
+    "test:stripe": "vitest run --config vitest.stripe.config.ts",
+    "test:dist": "vitest run --config vitest.dist.config.ts",
+    "pretest:min": "node scripts/copy-src.mjs",
+    "test:min": "pnpm --dir tests/min test",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check ."
+  },
+  "keywords": [
+    "better-auth",
+    "byo",
+    "entitlements",
+    "plans",
+    "features",
+    "usage",
+    "stripe",
+    "plugin",
+    "react"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/byo-oss/entitlements"
+  },
+  "homepage": "https://github.com/byo-oss/entitlements#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "peerDependencies": {
+    "@better-auth/stripe": "^1.7.7",
+    "better-auth": "^1.7.7",
+    "better-call": "^1.4.0",
+    "react": ">=18",
+    "vitest": ">=3"
+  },
+  "peerDependenciesMeta": {
+    "@better-auth/stripe": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    },
+    "vitest": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@byo-oss/core": "^0.1.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@better-auth/core": "1.7.12",
+    "@better-auth/kysely-adapter": "1.7.12",
+    "@better-auth/memory-adapter": "1.7.12",
+    "@better-auth/stripe": "1.7.12",
+    "@biomejs/biome": "^2.5.15",
+    "@byo-oss/notifications": "^0.9.0",
+    "@electric-sql/pglite": "^0.5.10",
+    "@testing-library/react": "^16.3.3",
+    "@types/node": "^22",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "better-auth": "1.7.12",
+    "better-call": "1.4.4",
+    "happy-dom": "^21.0.3",
+    "kysely": "^0.28.17",
+    "kysely-pglite": "^0.6.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "stripe": "^22",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9",
+    "vitest": "^4.1.10"
+  }
+}

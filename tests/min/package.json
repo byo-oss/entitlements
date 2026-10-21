@@ -1,0 +1,22 @@
+{
+  "name": "entitlements-floor-lane",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run && vitest run --config vitest.sql.config.ts && vitest run --config vitest.stripe.config.ts"
+  },
+  "devDependencies": {
+    "@better-auth/core": "1.7.7",
+    "@better-auth/drizzle-adapter": "1.7.7",
+    "@better-auth/kysely-adapter": "1.7.7",
+    "@better-auth/memory-adapter": "1.7.7",
+    "@better-auth/stripe": "1.7.7",
+    "@electric-sql/pglite": "^0.5.10",
+    "better-auth": "1.7.7",
+    "better-call": "1.4.0",
+    "kysely": "^0.28.17",
+    "kysely-pglite": "^0.6.1",
+    "stripe": "^22",
+    "vitest": "^4.1.10"
+  }
+}

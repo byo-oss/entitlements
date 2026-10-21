@@ -1,0 +1,12 @@
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    environment: "node",
+    include: ["src/**/*.dist.test.ts"],
+    env: {
+      BYO_EXPECT_BA: "1.7.12",
+      BYO_ROOT_BA: "1.7.12",
+    },
+  },
+});
