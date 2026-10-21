@@ -19,11 +19,12 @@ import {
   planEntitlements,
   upgradeTo,
 } from "./catalog";
-import { entitlementsClient, entitlementsPathMethods } from "./client";
+import { entitlementsClient } from "./client";
 import { ENTITLEMENTS_ERROR_CODES } from "./error-codes";
 import { ENTITLEMENTS_EVENT_TYPES, emit, entitlementsEvent } from "./events";
 import { entitlements } from "./index";
 import { ENTITLEMENTS_DEFAULTS, resolveOptions } from "./options";
+import { entitlementsPathMethods } from "./path-methods";
 import * as resolveModule from "./resolve";
 import {
   createRuntime,
@@ -985,7 +986,6 @@ describe("catalog helpers", () => {
       [
         ...PUBLIC_CATALOG_VALUES,
         "entitlementsClient",
-        "entitlementsPathMethods",
         "entitlementsStatements",
       ].sort(),
     );
