@@ -697,6 +697,10 @@ describe("plugin", () => {
     expect(result.features).toEqual(testCatalog.plans.free.features);
     expect(error).toHaveBeenCalledTimes(1);
     expect(error).toHaveBeenCalledWith(expect.any(String), failure);
+    // the state the checks read carries the error for onError (contracts D8)
+    const state = await resolveModule.resolveState(rt, organizationId);
+    expect(state.result.degraded).toBe(true);
+    expect(state.error).toBe(failure);
   });
 
   it("sync and the source's changed callback log a failed resync once and rethrow it", async () => {

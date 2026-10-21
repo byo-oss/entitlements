@@ -1,6 +1,7 @@
 import { runWithTransaction } from "@better-auth/core/context";
 import { sql } from "kysely";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { findOrganization } from "./adapter";
 import { createSqlTestAuth } from "./test-sql";
 import {
   expectNoOuterCalls,
@@ -140,6 +141,13 @@ describe("schema on PGlite", () => {
     ).rejects.toThrow(
       /findOne on entitlementSnapshot ran on the outer adapter/,
     );
+    expect(takeStrictViolations()).toHaveLength(1);
+    // a tagged organization read on the outer adapter is caught too
+    await expect(
+      expectNoOuterCalls(harness.auth, async () => {
+        await findOrganization(adapter, organizationId);
+      }),
+    ).rejects.toThrow(/organization ran on the outer adapter/);
     expect(takeStrictViolations()).toHaveLength(1);
   });
 });
