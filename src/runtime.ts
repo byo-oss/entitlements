@@ -118,16 +118,15 @@ export type AuthWithContext = { $context: Promise<object> };
 export const PLUGIN_ID = "entitlements";
 
 /**
- * The runtime of the entitlements plugin installed on `auth`. Awaits
- * `auth.$context` (so `init` has run) and reads the plugin's `options`,
- * which is the runtime. Throws
+ * The runtime of the entitlements plugin installed in a better-auth
+ * context (a source's `connect`, an endpoint's `ctx.context`). Reads the
+ * plugin's `options`, which is the runtime. Throws
  * `[@byo-oss/entitlements] <caller> needs the entitlements plugin installed on this auth instance`.
  */
-export async function runtimeFromAuth(
-  auth: AuthWithContext,
+export function runtimeFromContext(
+  context: { options: { plugins?: readonly { id: string }[] } },
   caller: string,
-): Promise<EntitlementsRuntime> {
-  const context = (await auth.$context) as AuthContext;
+): EntitlementsRuntime {
   const plugin = context.options.plugins?.find((p) => p.id === PLUGIN_ID) as
     | { options?: EntitlementsRuntime }
     | undefined;
@@ -138,4 +137,17 @@ export async function runtimeFromAuth(
     );
   }
   return rt;
+}
+
+/**
+ * The runtime of the entitlements plugin installed on `auth`. Awaits
+ * `auth.$context` (so `init` has run), then `runtimeFromContext`. Throws
+ * `[@byo-oss/entitlements] <caller> needs the entitlements plugin installed on this auth instance`.
+ */
+export async function runtimeFromAuth(
+  auth: AuthWithContext,
+  caller: string,
+): Promise<EntitlementsRuntime> {
+  const context = (await auth.$context) as AuthContext;
+  return runtimeFromContext(context, caller);
 }

@@ -318,12 +318,36 @@ describe("boot validation: options", () => {
     ["pastDueGraceDays", -1, /pastDueGraceDays must be a number of at least 0/],
     ["cacheTtlMs", -1, /cacheTtlMs must be an integer of at least 0/],
     ["cacheTtlMs", 1.5, /cacheTtlMs must be an integer/],
-    ["maxAge", 0, /maxAge must be an integer of at least 1/],
-    ["usageRetention", -5, /usageRetention must be an integer of at least 0/],
+    [
+      "maxAge",
+      0,
+      /maxAge must be an integer of at least 60000 \(ms; 1 minute\)/,
+    ],
+    ["maxAge", 59_999, /maxAge must be an integer of at least 60000/],
+    [
+      "usageRetention",
+      -5,
+      /usageRetention must be an integer of at least 86400000 \(ms; 1 day\)/,
+    ],
+    [
+      "usageRetention",
+      90,
+      /usageRetention must be an integer of at least 86400000/,
+    ],
+    [
+      "usageRetention",
+      86_399_999,
+      /usageRetention must be an integer of at least 86400000/,
+    ],
     [
       "overrideRetention",
       Number.NaN,
-      /overrideRetention must be an integer of at least 0/,
+      /overrideRetention must be an integer of at least 86400000/,
+    ],
+    [
+      "overrideRetention",
+      365,
+      /overrideRetention must be an integer of at least 86400000 \(ms; 1 day\)/,
     ],
     ["maxAttempts", 0, /maxAttempts must be an integer of at least 1/],
     ["batchSize", 1001, /batchSize must be an integer from 1 to 1000/],
@@ -332,6 +356,20 @@ describe("boot validation: options", () => {
   ])("%s = %s", (name, value, message) => {
     expect(bootWith({ [name]: value })).toThrow(PREFIX);
     expect(bootWith({ [name]: value })).toThrow(message);
+  });
+
+  it("accepts the smallest durations: maxAge 1 minute, retention 1 day", () => {
+    const resolved = resolveOptions({
+      catalog: testCatalog,
+      maxAge: 60_000,
+      usageRetention: 86_400_000,
+      overrideRetention: 86_400_000,
+    });
+    expect(resolved).toMatchObject({
+      maxAge: 60_000,
+      usageRetention: 86_400_000,
+      overrideRetention: 86_400_000,
+    });
   });
 
   it("applies the defaults table", () => {

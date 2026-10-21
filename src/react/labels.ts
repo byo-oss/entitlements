@@ -7,6 +7,7 @@ export type UsageMeterLabels = {
     used: number;
     limit: number | "unlimited";
     limitKey: string;
+    /** The key's period from `UsageMeter`'s `catalog` prop; null without one. */
     period: "day" | "month" | "billing" | null;
   }) => string;
   /** Shown while loading. */

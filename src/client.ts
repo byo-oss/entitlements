@@ -25,7 +25,30 @@ export const entitlementsClient = () => {
   } satisfies BetterAuthClientPlugin;
 };
 
-export * from "./catalog";
+// the public catalog API (the same list as catalog-entry.ts)
+export {
+  type AnyCatalog,
+  type CapacityKey,
+  type CapacityLimitDefinition,
+  type Catalog,
+  type CatalogInput,
+  defineEntitlements,
+  type FeatureKey,
+  type LimitDefinition,
+  type LimitKey,
+  type LimitKind,
+  type LimitValue,
+  type MeteredKey,
+  type MeteredLimitDefinition,
+  type MeteredPeriod,
+  type PlanAliasKey,
+  type PlanDefinition,
+  type PlanKey,
+  type UpgradeTarget,
+  upgradeTo,
+  type ValueKey,
+  type ValueLimitDefinition,
+} from "./catalog";
 export {
   type EntitlementsAction,
   entitlementsStatements,

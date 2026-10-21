@@ -15,7 +15,8 @@ export default defineConfig([
   {
     entry: {
       index: "src/index.ts",
-      catalog: "src/catalog.ts",
+      // the public catalog API only (catalog.ts also holds internal helpers)
+      catalog: "src/catalog-entry.ts",
       client: "src/client.ts",
       "stripe/index": "src/stripe/index.ts",
     },

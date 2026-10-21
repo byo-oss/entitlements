@@ -10,7 +10,11 @@
 
 import { kyselyAdapter } from "@better-auth/kysely-adapter";
 import { PGlite } from "@electric-sql/pglite";
-import { type BetterAuthOptions, betterAuth } from "better-auth";
+import {
+  type BetterAuthOptions,
+  type BetterAuthPlugin,
+  betterAuth,
+} from "better-auth";
 import { getMigrations } from "better-auth/db/migration";
 import { Kysely } from "kysely";
 import { KyselyPGlite } from "kysely-pglite";
@@ -21,7 +25,9 @@ import {
   wrapAdapterFactory,
 } from "./test-utils";
 
-export type SqlTestAuthConfig = TestAuthConfig & {
+export type SqlTestAuthConfig<
+  P extends BetterAuthPlugin[] = BetterAuthPlugin[],
+> = TestAuthConfig<P> & {
   /**
    * The Kysely adapter's `transaction` option. `false` builds an adapter
    * without real transactions (`transaction(cb)` is `cb(adapter)`).
@@ -35,10 +41,13 @@ export type SqlTestAuthConfig = TestAuthConfig & {
 /**
  * A migrated PGlite database and a `betterAuth` on it with the test plugins
  * (`organization`, `entitlements({ catalog: testCatalog, ...config.options })`,
- * `config.plugins`) and the Kysely adapter (`type: "postgres"`) behind the
- * strict wrapper. Call `close()` in `afterAll`/`afterEach`.
+ * `config.plugins`, typed on `auth.api`) and the Kysely adapter
+ * (`type: "postgres"`) behind the strict wrapper. Call `close()` in
+ * `afterAll`/`afterEach`.
  */
-export async function createSqlTestAuth(config: SqlTestAuthConfig = {}) {
+export async function createSqlTestAuth<P extends BetterAuthPlugin[] = []>(
+  config: SqlTestAuthConfig<P> = {},
+) {
   const pglite = new PGlite();
   // biome-ignore lint/suspicious/noExplicitAny: tables come from the migration, not a typed schema
   const db = new Kysely<any>({ dialect: new KyselyPGlite(pglite).dialect });
@@ -56,7 +65,7 @@ export async function createSqlTestAuth(config: SqlTestAuthConfig = {}) {
   const options = {
     ...mergeAuthOptions(config.authOptions),
     advanced,
-    plugins: testPlugins(config),
+    plugins: testPlugins<P>(config),
   };
   // getMigrations needs the object form of `database`; the auth below uses
   // a wrapped adapter factory on the same Kysely instance
@@ -86,4 +95,7 @@ export async function createSqlTestAuth(config: SqlTestAuthConfig = {}) {
   };
 }
 
-export type SqlTestAuth = Awaited<ReturnType<typeof createSqlTestAuth>>["auth"];
+/** A SQL-lane auth without extra plugins. */
+export type SqlTestAuth = Awaited<
+  ReturnType<typeof createSqlTestAuth<[]>>
+>["auth"];

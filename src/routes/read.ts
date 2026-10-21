@@ -14,9 +14,16 @@ import type { EntitlementsResponse } from "../types";
  * (POST `/entitlements/refresh`). Both: `sessionMiddleware`, then
  * `requireReader`; answer `EntitlementsResponse` (usage per metered key;
  * staff callers also get each override's `reason` and `createdBy`).
- * `getEntitlements` answers 503 `ENTITLEMENTS_UNAVAILABLE` instead of a
- * degraded result. `refreshEntitlements` runs `syncOrganization` (cache
- * bypassed) and throws inside a transaction.
+ * Members get each override's `{ kind, key, expiresAt }`; staff callers
+ * also get its `id`, `reason` and `createdBy`.
+ * 503 `ENTITLEMENTS_UNAVAILABLE` instead of a result when:
+ * - `getEntitlements`: `resolveState` came back degraded;
+ * - `refreshEntitlements`: `syncOrganization` threw (logged once here), or
+ *   its fresh state came back degraded;
+ * - either: `readUsage` threw (logged once).
+ * `refreshEntitlements` runs `syncOrganization` (cache bypassed) and, inside
+ * a transaction, throws `assertOutsideTransaction(rt, "refreshEntitlements")`
+ * (not a 503).
  * Stub: both answer 404 `ORGANIZATION_NOT_FOUND`.
  */
 export function readEndpoints(_rt: EntitlementsRuntime) {

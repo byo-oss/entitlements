@@ -13,10 +13,11 @@ import type { EntitlementOverride } from "./types";
 /** Longest override `reason`. */
 export const MAX_REASON_LENGTH = 500;
 
-/** `setEntitlementOverride`'s body, as received. */
+/** `setEntitlementOverride`'s body, as received (`kind` unchecked). */
 export type OverrideInput = {
   organizationId: string;
-  kind: OverrideKind;
+  /** Any string: a kind other than `plan`, `feature` or `limit` is `INVALID_OVERRIDE`. */
+  kind: string;
   key: string;
   value?: unknown;
   reason: string;
@@ -35,8 +36,8 @@ export type ValidOverride = {
 };
 
 /**
- * Checks an override against the catalog: `key` is a plan, feature or
- * limit key for its `kind`; a feature value is a boolean, a limit value a
+ * Checks an override against the catalog: `kind` is `plan`, `feature` or
+ * `limit`; `key` is a plan, feature or limit key for its `kind`; a feature value is a boolean, a limit value a
  * non-negative integer or `"unlimited"`, a plan value null/absent;
  * `expiresAt`, if given, parses and is after `now`; `reason` is 1–500
  * characters after trimming. Otherwise 400 `INVALID_OVERRIDE`.

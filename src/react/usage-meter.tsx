@@ -7,6 +7,11 @@ import type { UseEntitlementsResult } from "./use-entitlements";
 export type UsageMeterProps<C extends AnyCatalog = AnyCatalog> = {
   entitlements: UseEntitlementsResult<C>;
   limitKey: MeteredKey<C>;
+  /**
+   * The catalog, so the default text can name the period ("used today");
+   * without it `labels.usage` gets `period: null`.
+   */
+  catalog?: C;
   /** Classes on the outer element. */
   className?: string;
   /** Classes on the filled bar. */

@@ -97,13 +97,20 @@ export type EntitlementsResult<C extends AnyCatalog = AnyCatalog> = {
 
 /**
  * A resolution plus what the checks need beyond the result: the snapshot it
- * was computed from (null without one) and whether `isEntitled` held for it
- * (false without a snapshot). What the cache stores.
+ * was computed from (null without one), whether `isEntitled` held for it
+ * (false without a snapshot) and, for a degraded one, the error. What the
+ * cache stores (never a degraded state).
  */
 export type ResolvedState<C extends AnyCatalog = AnyCatalog> = {
   result: EntitlementsResult<C>;
   snapshot: EntitlementSnapshotRow | null;
   entitled: boolean;
+  /**
+   * Set whenever `result.degraded`: what the database, the source or the
+   * `resolveEntitlements` hook threw. The read that degraded already logged
+   * it; a check answers `onError(error, …)` with it and doesn't log again.
+   */
+  error?: unknown;
 };
 
 // ---------------------------------------------------------------------------
@@ -196,10 +203,16 @@ export type EntitlementOverride = {
   createdAt: Date;
 };
 
-/** An override in `getEntitlements`: staff callers also get `reason` and `createdBy`. */
+/**
+ * An override in `getEntitlements`: members get `{ kind, key, expiresAt }`;
+ * staff callers also get the row's `id`, `reason` and `createdBy`.
+ */
 export type EntitlementsResponseOverride = AppliedOverride & {
-  id: string;
+  /** Staff callers only. */
+  id?: string;
+  /** Staff callers only. */
   reason?: string;
+  /** Staff callers only. */
   createdBy?: string | null;
 };
 

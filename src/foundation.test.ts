@@ -12,6 +12,7 @@ import {
   IN_CHUNK,
   markEntitlementsQuery,
 } from "./adapter";
+import { createEntitlements } from "./api";
 import {
   canonicalPlanKey,
   limitKind,
@@ -23,10 +24,12 @@ import { ENTITLEMENTS_ERROR_CODES } from "./error-codes";
 import { ENTITLEMENTS_EVENT_TYPES, emit, entitlementsEvent } from "./events";
 import { entitlements } from "./index";
 import { ENTITLEMENTS_DEFAULTS, resolveOptions } from "./options";
+import * as resolveModule from "./resolve";
 import {
   createRuntime,
   requireContext,
   runtimeFromAuth,
+  runtimeFromContext,
   singleFlight,
   warnOnce,
 } from "./runtime";
@@ -42,17 +45,35 @@ import { createSqlTestAuth } from "./test-sql";
 import {
   addMember,
   expectNoOuterCalls,
+  fakeSource,
   getContext,
   getRuntime,
+  IN_TRANSACTION_PROBE_PATH,
+  inTransactionProbe,
   makeAuth,
   seedOrg,
   seedOverride,
+  seedUsage,
   setSnapshot,
   signUpUser,
   takeStrictViolations,
   testCatalog,
 } from "./test-utils";
 import { assertOutsideTransaction, currentAdapter, inTransaction } from "./txn";
+
+/** The public catalog API: `./catalog`, and the catalog part of `.` and `./client`. */
+const PUBLIC_CATALOG_VALUES = ["defineEntitlements", "upgradeTo"];
+const INTERNAL_CATALOG_HELPERS = [
+  "validateCatalog",
+  "canonicalPlanKey",
+  "planEntitlements",
+  "planKeys",
+  "limitKind",
+  "isFeatureKey",
+  "isLimitValue",
+  "MAX_CATALOG_KEYS",
+  "PLAN_KEY_PATTERN",
+];
 
 const snapshotWhere = (organizationId: string) => [
   { field: "organizationId", value: organizationId },
@@ -252,6 +273,50 @@ describe("transactions (txn.ts)", () => {
     ).rejects.toThrow(/outer adapter calls inside runWithTransaction/);
     expect(takeStrictViolations()).toHaveLength(2);
   });
+
+  it("also catches a tagged organization read on the outer adapter, and lets untagged better-auth reads pass", async () => {
+    const auth = makeAuth();
+    const rt = await getRuntime(auth);
+    const { adapter } = await getContext(auth);
+    const { organizationId } = await seedOrg(auth);
+    // entitlements' own read (tagged) through currentAdapter: fine
+    await expect(
+      expectNoOuterCalls(auth, async () =>
+        findOrganization(await currentAdapter(rt), organizationId),
+      ),
+    ).resolves.toMatchObject({ id: organizationId });
+    // the same tagged read on the outer adapter: caught
+    await expect(
+      expectNoOuterCalls(auth, () => findOrganization(adapter, organizationId)),
+    ).rejects.toThrow(/findOne on organization ran on the outer adapter/);
+    expect(takeStrictViolations()).toHaveLength(1);
+    // an untagged read (better-auth's own shape) on the outer adapter: passes
+    await expect(
+      expectNoOuterCalls(auth, () =>
+        adapter.findOne({
+          model: "organization",
+          where: [{ field: "id", value: organizationId }],
+        }),
+      ),
+    ).resolves.toMatchObject({ id: organizationId });
+  });
+
+  it("reads false in a plain auth.handler request (memory)", async () => {
+    const auth = makeAuth({ plugins: [inTransactionProbe()] });
+    const response = await auth.handler(
+      new Request(`http://localhost:3000/api/auth${IN_TRANSACTION_PROBE_PATH}`),
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ inTransaction: false });
+    // extra config.plugins are typed on auth.api
+    const direct: { inTransaction: boolean } =
+      await auth.api.testInTransaction();
+    expect(direct).toEqual({ inTransaction: false });
+    const { adapter } = await getContext(auth);
+    expect(
+      await runWithTransaction(adapter, () => auth.api.testInTransaction()),
+    ).toEqual({ inTransaction: true });
+  });
 });
 
 describe("schema", () => {
@@ -388,6 +453,50 @@ describe("schema", () => {
       permanent: true,
       value: "12",
     });
+  });
+
+  it("seedUsage writes a counter for the key's current period", async () => {
+    const auth = makeAuth();
+    const rt = await getRuntime(auth);
+    rt.now = () => new Date("2026-03-15T10:30:00.000Z");
+    const { organizationId } = await seedOrg(auth);
+    const daily = await seedUsage(auth, {
+      organizationId,
+      key: "apiCalls",
+      used: 7,
+    });
+    expect(daily).toMatchObject({
+      bucket: `${organizationId}:apiCalls:2026-03-15T00:00:00.000Z`,
+      organizationId,
+      key: "apiCalls",
+      used: 7,
+      refused: 0,
+    });
+    expect(daily.periodStart.toISOString()).toBe("2026-03-15T00:00:00.000Z");
+    expect(daily.periodEnd.toISOString()).toBe("2026-03-16T00:00:00.000Z");
+    const monthly = await seedUsage(auth, {
+      organizationId,
+      key: "uploads",
+      refused: 2,
+    });
+    expect(monthly.periodStart.toISOString()).toBe("2026-03-01T00:00:00.000Z");
+    expect(monthly.periodEnd.toISOString()).toBe("2026-04-01T00:00:00.000Z");
+    expect(monthly).toMatchObject({ used: 0, refused: 2 });
+    const start = new Date("2026-03-10T00:00:00.000Z");
+    const end = new Date("2026-04-10T00:00:00.000Z");
+    const billing = await seedUsage(auth, {
+      organizationId,
+      key: "reports",
+      periodStart: start,
+      periodEnd: end,
+    });
+    expect(billing.bucket).toBe(
+      `${organizationId}:reports:2026-03-10T00:00:00.000Z`,
+    );
+    expect(billing.periodEnd).toEqual(end);
+    await expect(
+      seedUsage(auth, { organizationId, key: "members" }),
+    ).rejects.toThrow(/isn't a metered limit/);
   });
 });
 
@@ -550,6 +659,71 @@ describe("plugin", () => {
     );
   });
 
+  it("runtimeFromContext finds the runtime in a context, and names the caller without the plugin", async () => {
+    const auth = makeAuth();
+    const context = await getContext(auth);
+    expect(runtimeFromContext(context, "connect")).toBe(await getRuntime(auth));
+    expect(() =>
+      runtimeFromContext({ options: { plugins: [] } }, "connect"),
+    ).toThrow(
+      "[@byo-oss/entitlements] connect needs the entitlements plugin installed on this auth instance",
+    );
+  });
+
+  it("a throwing resolveEntitlements hook degrades the read, carries the error and logs once", async () => {
+    const failure = new Error("hook down");
+    const auth = makeAuth({
+      options: {
+        resolveEntitlements: () => {
+          throw failure;
+        },
+      },
+    });
+    const rt = await getRuntime(auth);
+    const error = vi.fn();
+    rt.logger = { ...rt.logger, error };
+    const { organizationId } = await seedOrg(auth);
+    const result = await createEntitlements(auth, testCatalog).get(
+      organizationId,
+    );
+    expect(result).toMatchObject({
+      organizationId,
+      degraded: true,
+      plan: { key: "free", source: "default" },
+      status: null,
+      periodEnd: null,
+    });
+    expect(result.features).toEqual(testCatalog.plans.free.features);
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(error).toHaveBeenCalledWith(expect.any(String), failure);
+  });
+
+  it("sync and the source's changed callback log a failed resync once and rethrow it", async () => {
+    const source = fakeSource();
+    const auth = makeAuth({ options: { source } });
+    const rt = await getRuntime(auth);
+    const error = vi.fn();
+    rt.logger = { ...rt.logger, error };
+    const failure = new Error("billing down");
+    const spy = vi
+      .spyOn(resolveModule, "syncOrganization")
+      .mockRejectedValue(failure);
+    try {
+      await expect(
+        createEntitlements(auth, testCatalog).sync("org_1"),
+      ).rejects.toBe(failure);
+      expect(error).toHaveBeenCalledTimes(1);
+      expect(error).toHaveBeenCalledWith(
+        "[@byo-oss/entitlements] sync failed for organization org_1",
+        failure,
+      );
+      await expect(source.changed?.("org_1")).rejects.toBe(failure);
+      expect(error).toHaveBeenCalledTimes(2);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("requireContext throws before init", () => {
     const rt = createRuntime(resolveOptions({ catalog: testCatalog }));
     expect(() => requireContext(rt)).toThrow(/isn't initialized yet/);
@@ -703,6 +877,7 @@ describe("events", () => {
         actorId: "user_1",
         overrideId: "ov_1",
         data: { kind: "feature", key: "exports" },
+        occurredAt: at,
       }).subject,
     ).toEqual({ type: "entitlementOverride", id: "ov_1" });
   });
@@ -713,6 +888,7 @@ describe("events", () => {
       organizationId: "org_1",
       actorId: null,
       data: { key: "apiCalls", limit: 10, periodEnd: new Date() },
+      occurredAt: new Date("2026-01-01T00:00:00Z"),
     });
     const seen: unknown[] = [];
     await emit(
@@ -785,6 +961,11 @@ describe("catalog helpers", () => {
     expect(canonicalPlanKey(testCatalog, "gold")).toBeNull();
     expect(canonicalPlanKey(testCatalog, "toString")).toBeNull();
     expect(canonicalPlanKey(testCatalog, null)).toBeNull();
+    // a catalog without planAliases (not built by defineEntitlements)
+    const { planAliases: _, ...bare } = testCatalog;
+    const noAliases = bare as unknown as typeof testCatalog;
+    expect(canonicalPlanKey(noAliases, "pro")).toBe("pro");
+    expect(canonicalPlanKey(noAliases, "legacy")).toBeNull();
     expect(limitKind(testCatalog, "apiCalls")).toBe("metered");
     expect(limitKind(testCatalog, "members")).toBe("capacity");
     expect(limitKind(testCatalog, "exports")).toBeNull();
@@ -792,6 +973,40 @@ describe("catalog helpers", () => {
     copy.limits.members = 99;
     expect(testCatalog.plans.free.limits.members).toBe(5);
     expect(copy.display).toEqual({ name: "Free" });
+  });
+
+  it("./catalog, ./client and . export only the public catalog API", async () => {
+    const entry = await import("./catalog-entry");
+    expect(Object.keys(entry).sort()).toEqual(
+      [...PUBLIC_CATALOG_VALUES].sort(),
+    );
+    const client = await import("./client");
+    expect(Object.keys(client).sort()).toEqual(
+      [
+        ...PUBLIC_CATALOG_VALUES,
+        "entitlementsClient",
+        "entitlementsPathMethods",
+        "entitlementsStatements",
+      ].sort(),
+    );
+    const root = await import("./index");
+    expect(Object.keys(root).sort()).toEqual(
+      [
+        ...PUBLIC_CATALOG_VALUES,
+        "entitlements",
+        "createEntitlements",
+        "deleteOrganizationData",
+        "exportEntitlementsData",
+        "entitlementsStatements",
+        "ENTITLEMENTS_ERROR_CODES",
+        "ENTITLEMENTS_EVENT_TYPES",
+      ].sort(),
+    );
+    for (const name of INTERNAL_CATALOG_HELPERS) {
+      expect(entry, name).not.toHaveProperty(name);
+      expect(client, name).not.toHaveProperty(name);
+      expect(root, name).not.toHaveProperty(name);
+    }
   });
 
   it("statements", () => {

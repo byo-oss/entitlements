@@ -12,7 +12,12 @@ import {
   type PlanKey,
   upgradeTo,
 } from "./catalog";
-import type { EntitlementsResult } from "./types";
+import type { UsageMeterProps } from "./react/usage-meter";
+import type {
+  EntitlementsResponseOverride,
+  EntitlementsResult,
+  ResolvedState,
+} from "./types";
 
 declare const auth: { $context: Promise<object> };
 
@@ -204,3 +209,25 @@ export async function callSites(organizationId: string) {
   // @ts-expect-error upgradeTo with an unknown feature
   upgradeTo(catalog, { feature: "nope" });
 }
+
+// members get { kind, key, expiresAt }; id, reason and createdBy are staff-only
+const memberOverride: EntitlementsResponseOverride = {
+  kind: "feature",
+  key: "exports",
+  expiresAt: null,
+};
+const staffOverride: EntitlementsResponseOverride = {
+  ...memberOverride,
+  id: "ov_1",
+  reason: "trial",
+  createdBy: null,
+};
+void staffOverride;
+
+// a degraded state carries the error the read caught
+assertType<Equal<ResolvedState["error"], unknown>>();
+
+// UsageMeter takes the catalog (optional), typed like EntitlementGate's
+assertType<
+  Equal<UsageMeterProps<typeof catalog>["catalog"], typeof catalog | undefined>
+>();

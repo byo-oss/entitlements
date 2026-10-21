@@ -6,7 +6,8 @@ import type { EntitlementsSweepResult } from "./types";
  * One sweep batch (PRD Background work): release stale claims; claim up to
  * `batchSize` due idle snapshots with a guarded `incrementOne`; resolve and
  * write version-guarded through `toSnapshotFields` (emitting
- * `plan.changed` through `notifyPlanChange`); back off or count `failed`;
+ * `plan.changed` through `notifyPlanChange`), then clear that
+ * organization's cache entry (`rt.cache.delete`); back off or count `failed`;
  * mark expired overrides; prune usage and ended overrides past retention.
  * Steps 1–4 are skipped without a source. Must run outside a transaction.
  * Stub: does nothing.

@@ -156,19 +156,19 @@ export type EntitlementsOptions<C extends AnyCatalog = AnyCatalog> = {
   cacheTtlMs?: number;
   /**
    * A snapshot older than this (ms) is served, then refreshed in the
-   * background.
+   * background. At least 60000 (1 minute).
    * @default 3600000 (1 hour)
    */
   maxAge?: number;
   /**
    * The sweep deletes `entitlementUsage` rows whose period ended longer ago
-   * than this (ms).
+   * than this (ms). At least 86400000 (1 day).
    * @default 7776000000 (90 days)
    */
   usageRetention?: number;
   /**
    * The sweep deletes removed or expired overrides that ended longer ago
-   * than this (ms).
+   * than this (ms). At least 86400000 (1 day).
    * @default 31536000000 (365 days)
    */
   overrideRetention?: number;
@@ -240,6 +240,14 @@ export const ENTITLEMENTS_DEFAULTS = {
   leaseMs: 5 * 60 * 1000,
 } as const;
 
+/**
+ * Smallest `maxAge` (ms): 1 minute. Every duration option is in ms, so a
+ * value given in days or hours fails boot instead of meaning milliseconds.
+ */
+export const MIN_MAX_AGE = 60_000;
+/** Smallest `usageRetention` and `overrideRetention` (ms): 1 day. */
+export const MIN_RETENTION = 86_400_000;
+
 /** Most snapshots one sweep call claims. */
 export const MAX_BATCH_SIZE = 1000;
 
@@ -256,7 +264,7 @@ function numberOption(
   options: Record<string, unknown>,
   name: string,
   fallback: number,
-  rule: { min: number; integer?: boolean; max?: number },
+  rule: { min: number; integer?: boolean; max?: number; hint?: string },
 ): number {
   const value = options[name];
   if (value === undefined) return fallback;
@@ -272,7 +280,9 @@ function numberOption(
       rule.max !== undefined
         ? `from ${rule.min} to ${rule.max}`
         : `of at least ${rule.min}`;
-    return fail(`${name} must be ${kind} ${range}`);
+    return fail(
+      `${name} must be ${kind} ${range}${rule.hint ? ` (${rule.hint})` : ""}`,
+    );
   }
   return value;
 }
@@ -284,7 +294,8 @@ function numberOption(
  * - `staffOrganizationId` set to an empty string;
  * - a `source` without a non-empty `id` (`"none"` is reserved) or a
  *   `resolve` function;
- * - a numeric option out of range.
+ * - a numeric option out of range (`maxAge` at least 1 minute,
+ *   `usageRetention`/`overrideRetention` at least 1 day, all in ms).
  *
  * Checks that need better-auth (the organization plugin, `source.connect`)
  * run in the plugin's `init`.
@@ -344,16 +355,21 @@ export function resolveOptions<C extends AnyCatalog>(
       min: 0,
       integer: true,
     }),
-    maxAge: numberOption(raw, "maxAge", d.maxAge, { min: 1, integer: true }),
-    usageRetention: numberOption(raw, "usageRetention", d.usageRetention, {
-      min: 0,
+    maxAge: numberOption(raw, "maxAge", d.maxAge, {
+      min: MIN_MAX_AGE,
       integer: true,
+      hint: "ms; 1 minute",
+    }),
+    usageRetention: numberOption(raw, "usageRetention", d.usageRetention, {
+      min: MIN_RETENTION,
+      integer: true,
+      hint: "ms; 1 day",
     }),
     overrideRetention: numberOption(
       raw,
       "overrideRetention",
       d.overrideRetention,
-      { min: 0, integer: true },
+      { min: MIN_RETENTION, integer: true, hint: "ms; 1 day" },
     ),
     organizationCleanup: options.organizationCleanup ?? d.organizationCleanup,
     maxAttempts: numberOption(raw, "maxAttempts", d.maxAttempts, {

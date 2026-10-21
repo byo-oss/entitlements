@@ -60,8 +60,10 @@ export type EntitlementsEvent<
   : never;
 
 /**
- * Builds an event: `occurredAt` now unless given; subject the organization,
- * or the override for `override.*` (pass `overrideId`).
+ * Builds an event; subject the organization, or the override for
+ * `override.*` (pass `overrideId`). Callers pass `occurredAt: rt.now()`, so
+ * a test clock applies; the `new Date()` fallback is only for callers
+ * without a runtime.
  */
 export function entitlementsEvent<T extends EntitlementsEventType>(
   type: T,
@@ -71,6 +73,7 @@ export function entitlementsEvent<T extends EntitlementsEventType>(
     data: EntitlementsEventData[T];
     /** Required for `override.*` events: the override row's id. */
     overrideId?: string;
+    /** Pass `rt.now()`. */
     occurredAt?: Date;
   },
 ): EntitlementsEvent<T> {

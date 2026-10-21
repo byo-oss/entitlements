@@ -7,9 +7,11 @@ import type { CapacityResult } from "./types";
  * (`"unlimited"` always allows), `over = count > limit`, `reason`
  * `"limit_reached"` when refused, with `upgradeTo` for
  * `count + adding`. `adding` defaults to 1; `count` and `adding` are
- * non-negative integers. Works inside a transaction. A failure answers
- * `onError` (`reason: "error"`), logged. Throws `UNKNOWN_KEY` for a key that
- * isn't a capacity limit.
+ * non-negative integers. Works inside a transaction. A degraded
+ * `resolveState` answers `rt.options.onError(state.error, { organizationId,
+ * key, operation: "checkCapacity" })` with `reason: "error"` and doesn't log
+ * again (the read logged it). Throws `UNKNOWN_KEY` for a key that isn't a
+ * capacity limit.
  * Stub: refuses.
  */
 export async function checkCapacity(

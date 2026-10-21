@@ -7,7 +7,7 @@ import {
 import * as z from "zod";
 import { ENTITLEMENTS_ERROR_CODES } from "../error-codes";
 import type { EntitlementsRuntime } from "../runtime";
-import { OVERRIDE_KINDS, OVERRIDE_STATUSES } from "../schema";
+import { OVERRIDE_STATUSES } from "../schema";
 import type {
   ListOverridesResponse,
   RemoveOverrideResponse,
@@ -21,7 +21,11 @@ export const OVERRIDES_PAGE_SIZE = 50;
  * The staff endpoints, each `sessionMiddleware` then `requireStaff`:
  * - `setEntitlementOverride` (POST `/entitlements/override/set`,
  *   `entitlements:override`): `requireOrgExists`, `validateOverride`,
- *   `setOverride` → `{ override }`.
+ *   `setOverride` → `{ override }`. The body schema is loose (`kind`,
+ *   `key` any string, `value` unknown), so every override rule answers 400
+ *   `INVALID_OVERRIDE`; only a field of the wrong JSON type for a string
+ *   (or `expiresAt` that is neither a string, a Date nor null) gets
+ *   better-auth's own 400.
  * - `removeEntitlementOverride` (POST `/entitlements/override/remove`,
  *   `entitlements:override`): `removeOverride` → `{ ok: true }`.
  * - `listEntitlementOverrides` (GET `/entitlements/overrides`,
@@ -38,13 +42,14 @@ export function overrideEndpoints(_rt: EntitlementsRuntime) {
       "/entitlements/override/set",
       {
         method: "POST",
+        // loose on purpose: a wrong kind, key or value reaches
+        // validateOverride and answers 400 INVALID_OVERRIDE (PRD), not
+        // better-auth's own 400
         body: z.object({
           organizationId: z.string().min(1),
-          kind: z.enum(OVERRIDE_KINDS),
-          key: z.string().min(1),
-          value: z
-            .union([z.boolean(), z.number(), z.literal("unlimited"), z.null()])
-            .optional(),
+          kind: z.string(),
+          key: z.string(),
+          value: z.unknown(),
           reason: z.string(),
           expiresAt: z.union([z.date(), z.string()]).nullable().optional(),
         }),

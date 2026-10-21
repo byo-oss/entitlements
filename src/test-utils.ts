@@ -13,6 +13,7 @@ import {
   betterAuth,
   type DBAdapter,
 } from "better-auth";
+import { createAuthEndpoint } from "better-auth/api";
 import { createAccessControl } from "better-auth/plugins/access";
 import { organization } from "better-auth/plugins/organization";
 import {
@@ -23,18 +24,25 @@ import {
 } from "better-auth/plugins/organization/access";
 import { afterEach } from "vitest";
 import { IN_CHUNK, isEntitlementsQuery } from "./adapter";
-import { type AnyCatalog, defineEntitlements } from "./catalog";
+import { type AnyCatalog, defineEntitlements, limitKind } from "./catalog";
 import { entitlements } from "./index";
 import type { EntitlementsOptions } from "./options";
-import { type EntitlementsRuntime, runtimeFromAuth } from "./runtime";
+import { bucketKey } from "./period";
+import {
+  type EntitlementsRuntime,
+  runtimeFromAuth,
+  runtimeFromContext,
+} from "./runtime";
 import {
   type EntitlementOverrideRow,
   type EntitlementSnapshotRow,
+  type EntitlementUsageRow,
   encodeOverrideValue,
   type OverrideKind,
   type OverrideValue,
 } from "./schema";
 import { entitlementsStatements } from "./statements";
+import { inTransaction } from "./txn";
 import type { BillingSource, BillingState } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -168,7 +176,10 @@ const WRAPPED = [
 /** Models whose every call is checked; other models only when tagged (`markEntitlementsQuery`). */
 const isOwnModel = (model: string) => model.startsWith("entitlement");
 
-/** Models an `outer` call to inside `expectNoOuterCalls` fails the test. */
+/**
+ * Models an `outer` call to inside `expectNoOuterCalls` fails the test
+ * (besides any tagged query: `markEntitlementsQuery`).
+ */
 const isTrackedModel = (model: string) =>
   isOwnModel(model) || model === "subscription";
 
@@ -249,7 +260,11 @@ export function wrapAdapter<A extends Omit<DBAdapter, "transaction">>(
         scope,
       };
       if (strict) checkCall(method, args);
-      if (scope === "outer" && probe && isTrackedModel(call.model)) {
+      if (
+        scope === "outer" &&
+        probe &&
+        (isTrackedModel(call.model) || isEntitlementsQuery(args))
+      ) {
         probe.outer.push(call);
         const message = `[outer adapter] ${method} on ${call.model} ran on the outer adapter inside runWithTransaction`;
         strictViolations.push(message);
@@ -297,8 +312,9 @@ export function hasRealTransactions(adapter: DBAdapter): boolean {
 
 /**
  * Runs `fn` inside `runWithTransaction(ctx.adapter, …)` and fails if any
- * call to an `entitlement*` or `subscription` model went to the outer
- * adapter meanwhile (the call itself throws, so a single-connection
+ * call to an `entitlement*` or `subscription` model, or any tagged query
+ * (`markEntitlementsQuery`: entitlements' `organization`, `member` and
+ * `user` reads), went to the outer adapter meanwhile (the call itself throws, so a single-connection
  * database can't hang on it, and the violation is recorded even if the
  * code under test swallows the throw). Returns `fn`'s result. Throws for an
  * adapter without real transactions, where every call is "outer" by
@@ -332,6 +348,33 @@ export async function expectNoOuterCalls<T>(
     );
   }
   return result;
+}
+
+/** Path of `inTransactionProbe`'s endpoint (under `/api/auth`). */
+export const IN_TRANSACTION_PROBE_PATH = "/test/in-transaction";
+
+/**
+ * A test-only plugin with one endpoint, `testInTransaction` (GET
+ * `/test/in-transaction`, no session needed), that answers
+ * `{ inTransaction: await inTransaction(rt) }` from inside a request, so a
+ * test can show detection reads false in a plain `auth.handler` request.
+ * Pass it in `config.plugins`; it comes after entitlements.
+ */
+export function inTransactionProbe() {
+  return {
+    id: "entitlements-test-probe",
+    endpoints: {
+      testInTransaction: createAuthEndpoint(
+        IN_TRANSACTION_PROBE_PATH,
+        { method: "GET" },
+        async (ctx) => ({
+          inTransaction: await inTransaction(
+            runtimeFromContext(ctx.context, "inTransactionProbe"),
+          ),
+        }),
+      ),
+    },
+  } satisfies BetterAuthPlugin;
 }
 
 // ---------------------------------------------------------------------------
@@ -423,25 +466,28 @@ export function mergeAuthOptions(extra?: Partial<BetterAuthOptions>) {
   };
 }
 
-export type TestAuthConfig = {
-  /** Entitlements options over `{ catalog: testCatalog }`. */
-  options?: Partial<EntitlementsOptions<AnyCatalog>>;
-  /** Extra better-auth options (merged over the base). */
-  authOptions?: Partial<BetterAuthOptions>;
-  /** Plugins after organization() and entitlements(). */
-  plugins?: BetterAuthPlugin[];
-  /** Install the organization plugin. @default true */
-  organization?: boolean;
-  /** Adapter wrapper options. @default { strict: true } */
-  adapter?: WrapAdapterOptions;
-};
+export type TestAuthConfig<P extends BetterAuthPlugin[] = BetterAuthPlugin[]> =
+  {
+    /** Entitlements options over `{ catalog: testCatalog }`. */
+    options?: Partial<EntitlementsOptions<AnyCatalog>>;
+    /** Extra better-auth options (merged over the base). */
+    authOptions?: Partial<BetterAuthOptions>;
+    /** Plugins after organization() and entitlements(); their endpoints are typed on `auth.api`. */
+    plugins?: P;
+    /** Install the organization plugin. @default true */
+    organization?: boolean;
+    /** Adapter wrapper options. @default { strict: true } */
+    adapter?: WrapAdapterOptions;
+  };
 
 /**
  * The plugin list for a test config. Typed as organization + entitlements
- * so `auth.api` carries both plugins' endpoints (also when
- * `organization: false`, where calling the org endpoints would fail).
+ * + `config.plugins`, so `auth.api` carries every plugin's endpoints (also
+ * when `organization: false`, where calling the org endpoints would fail).
  */
-export function testPlugins(config: TestAuthConfig) {
+export function testPlugins<P extends BetterAuthPlugin[] = []>(
+  config: TestAuthConfig<P>,
+) {
   const plugins: BetterAuthPlugin[] = [
     ...(config.organization === false ? [] : [testOrganization()]),
     entitlements({ catalog: testCatalog, ...config.options }),
@@ -450,6 +496,7 @@ export function testPlugins(config: TestAuthConfig) {
   return plugins as unknown as [
     ReturnType<typeof testOrganization>,
     ReturnType<typeof entitlements<AnyCatalog>>,
+    ...P,
   ];
 }
 
@@ -464,12 +511,15 @@ function seededMemoryDB(options: BetterAuthOptions): MemoryDB {
 /**
  * A real `betterAuth` with `organization({ ac, roles })` (unless turned
  * off), `entitlements({ catalog: testCatalog, ...config.options })` and the
- * memory adapter behind the strict wrapper.
+ * memory adapter behind the strict wrapper. `config.plugins` come last, and
+ * their endpoints are typed on `auth.api`.
  */
-export function makeAuth(config: TestAuthConfig = {}) {
+export function makeAuth<P extends BetterAuthPlugin[] = []>(
+  config: TestAuthConfig<P> = {},
+) {
   const options = {
     ...mergeAuthOptions(config.authOptions),
-    plugins: testPlugins(config),
+    plugins: testPlugins<P>(config),
   };
   const memoryDB = seededMemoryDB(options);
   return betterAuth({
@@ -767,6 +817,77 @@ export async function seedOverride(
       ...rest,
       expiresAt,
       value: encodeOverrideValue(decoded),
+    },
+  });
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The harness's own current period for a metered key (independent of
+ * `periodFor`): `day` → the UTC day of `now`; `month` and `billing` → the
+ * UTC month (`billing` as for an organization without an entitled
+ * snapshot period).
+ */
+function defaultUsagePeriod(
+  period: string,
+  now: Date,
+): { start: Date; end: Date } {
+  if (period === "day") {
+    const start = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
+    );
+    return { start, end: new Date(start.getTime() + DAY_MS) };
+  }
+  return {
+    start: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)),
+    end: new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1)),
+  };
+}
+
+/**
+ * Inserts a usage counter row directly (`bucket` from `bucketKey`).
+ * Defaults: the key's current period as the harness computes it (`day` →
+ * the UTC day of `rt.now()`; `month` and `billing` → the UTC month), so
+ * pass `periodStart`/`periodEnd` for a snapshot's billing period;
+ * `used: 0`, `refused: 0`. Throws for a key that isn't a metered limit of
+ * the plugin's catalog. No events, no cache changes.
+ */
+export async function seedUsage(
+  auth: AnyTestAuth,
+  input: {
+    organizationId: string;
+    key: string;
+    periodStart?: Date;
+    periodEnd?: Date;
+    used?: number;
+    refused?: number;
+  },
+): Promise<EntitlementUsageRow> {
+  const { adapter } = await getContext(auth);
+  const rt = await getRuntime(auth);
+  if (limitKind(rt.catalog, input.key) !== "metered") {
+    throw new Error(`seedUsage: "${input.key}" isn't a metered limit`);
+  }
+  const definition = (rt.catalog.limits as Record<string, { period: string }>)[
+    input.key
+  ] as { period: string };
+  const now = rt.now();
+  const period = defaultUsagePeriod(definition.period, now);
+  const periodStart = input.periodStart ?? period.start;
+  const periodEnd = input.periodEnd ?? period.end;
+  return adapter.create<Omit<EntitlementUsageRow, "id">, EntitlementUsageRow>({
+    model: "entitlementUsage",
+    data: {
+      bucket: bucketKey(input.organizationId, input.key, periodStart),
+      organizationId: input.organizationId,
+      key: input.key,
+      periodStart,
+      periodEnd,
+      used: input.used ?? 0,
+      refused: input.refused ?? 0,
+      createdAt: now,
+      updatedAt: now,
     },
   });
 }

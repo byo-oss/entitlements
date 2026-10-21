@@ -29,7 +29,11 @@ export type GetLimitResult<C extends AnyCatalog, K extends LimitKey<C>> =
 /**
  * The typed server API, from `createEntitlements(auth, catalog)`. Every
  * method takes a plain organization id, so an app can wrap it behind its own
- * tenant checks. None throws for a refusal or an outage (see each result);
+ * tenant checks. The reads and checks never throw for a refusal or an
+ * outage: `get`, `getMany` and `getLimit` answer `defaultPlan` with
+ * `degraded: true`, and `hasFeature`, `consumeUsage` and `checkCapacity`
+ * answer what `onError` says, with `reason: "error"`. `sync` is the
+ * exception: it throws when the billing source or the database fails.
  * `consumeUsage` and `sync` throw inside a transaction.
  */
 export type Entitlements<C extends AnyCatalog> = {
@@ -59,7 +63,11 @@ export type Entitlements<C extends AnyCatalog> = {
     key: K,
     options: { count: number; adding?: number },
   ): Promise<CapacityResult<C, K>>;
-  /** Resyncs from the billing source now and returns the fresh result (cache bypassed). */
+  /**
+   * Resyncs from the billing source now and returns the fresh result (cache
+   * bypassed). Throws when the source or the database fails (nothing is
+   * persisted; the failure is logged once), and inside a transaction.
+   */
   sync(organizationId: string): Promise<EntitlementsResult<C>>;
   /** Clears this process's cached result for the organization. */
   invalidate(organizationId: string): Promise<void>;
@@ -135,9 +143,19 @@ export function createEntitlements<C extends AnyCatalog>(
       (await consumeUsage(await rt(), organizationId, key, options)) as never,
     checkCapacity: async (organizationId, key, options) =>
       (await checkCapacity(await rt(), organizationId, key, options)) as never,
-    sync: async (organizationId) =>
-      (await syncOrganization(await rt(), organizationId))
-        .result as EntitlementsResult<C>,
+    sync: async (organizationId) => {
+      const runtime = await rt();
+      try {
+        return (await syncOrganization(runtime, organizationId))
+          .result as EntitlementsResult<C>;
+      } catch (error) {
+        runtime.logger.error(
+          `[@byo-oss/entitlements] sync failed for organization ${organizationId}`,
+          error,
+        );
+        throw error;
+      }
+    },
     invalidate: async (organizationId) => {
       (await rt()).cache.delete(organizationId);
     },

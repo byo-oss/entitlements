@@ -19,8 +19,11 @@ import type {
  * `amount` (default 1) must be a positive integer.
  * Throws `[@byo-oss/entitlements] consumeUsage must run outside a
  * transaction` inside one, and `[@byo-oss/entitlements] UNKNOWN_KEY: …` for
- * a key that isn't a metered limit. A database or source failure answers
- * `onError` with `reason: "error"` and is logged.
+ * a key that isn't a metered limit. Failures answer
+ * `rt.options.onError(error, { organizationId, key, operation:
+ * "consumeUsage" })` with `reason: "error"`: a degraded `resolveState`
+ * answers with `state.error` and is not logged again (the read logged it);
+ * a failure of this function's own queries is logged once.
  * Stub: refuses without touching the database.
  */
 export async function consumeUsage(
@@ -46,7 +49,9 @@ export async function consumeUsage(
 /**
  * The counter of a metered key for the current period of `state`, read
  * with `findOne` on the bucket (no row → `used: 0`). Never creates a
- * bucket. `remaining = max(0, limit - used)`, or `"unlimited"`.
+ * bucket. `remaining = max(0, limit - used)`, or `"unlimited"`. A query
+ * error throws; it never logs (its caller logs once: `getLimit`, or the
+ * read endpoints, which answer 503).
  * Stub: `used: 0`.
  */
 export async function readUsage(
@@ -64,7 +69,9 @@ export async function readUsage(
  * get `{ used, remaining, resetAt }` (`readUsage`; no bucket is created).
  * `allowed`/`reason`: `"not_in_plan"` when the limit is 0, metered keys
  * `"limit_reached"` when `remaining` is 0, else `"ok"`. A failure answers
- * `defaultPlan` with `degraded: true` (`reason: "error"`), logged.
+ * `defaultPlan` with `degraded: true` (`reason: "error"`): a degraded
+ * `resolveState` is not logged again (the read logged it); a `readUsage`
+ * throw is logged once here.
  * Throws `UNKNOWN_KEY` for a key that isn't a limit.
  * Stub: limit 0, not degraded.
  */
@@ -86,9 +93,11 @@ export async function getLimit(
 
 /**
  * `hasFeature`: `allowed` = the resolved feature value; `reason`
- * `"not_in_plan"` when false, with `upgradeTo`. A failure answers
- * `onError` (`reason: "error"`), logged. Throws `UNKNOWN_KEY` for a key
- * that isn't a feature.
+ * `"not_in_plan"` when false, with `upgradeTo`. A degraded `resolveState`
+ * answers `rt.options.onError(state.error, { organizationId, key,
+ * operation: "hasFeature" })` with `reason: "error"` and doesn't log again
+ * (the read logged it). Throws `UNKNOWN_KEY` for a key that isn't a
+ * feature.
  * Stub: not allowed.
  */
 export async function hasFeature(

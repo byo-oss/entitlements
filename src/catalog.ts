@@ -2,7 +2,10 @@
  * The entitlements catalog: features, limits and plans, declared once and
  * imported by the server, the web app and a static pricing page.
  *
- * This module imports nothing, so it is safe in any bundle.
+ * This module imports nothing, so it is safe in any bundle. The public
+ * subpath `./catalog` (`catalog-entry.ts`) re-exports only
+ * `defineEntitlements`, `upgradeTo` and the types; the other helpers here are
+ * internal.
  *
  * ```ts
  * export const catalog = defineEntitlements({
@@ -413,9 +416,9 @@ export function canonicalPlanKey<C extends AnyCatalog>(
 ): PlanKey<C> | null {
   if (!key) return null;
   if (has(catalog.plans, key)) return key as PlanKey<C>;
-  if (has(catalog.planAliases, key)) {
-    return (catalog.planAliases as Record<string, string>)[key] as PlanKey<C>;
-  }
+  // a catalog not built by defineEntitlements may leave planAliases out
+  const aliases = (catalog.planAliases ?? {}) as Record<string, string>;
+  if (has(aliases, key)) return aliases[key] as PlanKey<C>;
   return null;
 }
 

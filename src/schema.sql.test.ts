@@ -6,16 +6,21 @@ import {
   expectNoOuterCalls,
   getContext,
   getRuntime,
+  IN_TRANSACTION_PROBE_PATH,
+  inTransactionProbe,
   seedOrg,
   takeStrictViolations,
 } from "./test-utils";
 import { currentAdapter, inTransaction } from "./txn";
 
+const createHarness = () =>
+  createSqlTestAuth({ plugins: [inTransactionProbe()] });
+
 describe("schema on PGlite", () => {
-  let harness: Awaited<ReturnType<typeof createSqlTestAuth>>;
+  let harness: Awaited<ReturnType<typeof createHarness>>;
 
   beforeAll(async () => {
-    harness = await createSqlTestAuth();
+    harness = await createHarness();
   });
   afterAll(async () => {
     await harness?.close();
@@ -97,6 +102,21 @@ describe("schema on PGlite", () => {
     expect(inside.detected).toBe(true);
     expect(inside.current).not.toBe(adapter);
     expect(await inTransaction(rt)).toBe(false);
+  });
+
+  it("detects a transaction: false in a plain auth.handler request", async () => {
+    const response = await harness.auth.handler(
+      new Request(`http://localhost:3000/api/auth${IN_TRANSACTION_PROBE_PATH}`),
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ inTransaction: false });
+    // the probe's endpoint is typed on auth.api, and reads true inside one
+    const { adapter } = await getContext(harness.auth);
+    expect(
+      await runWithTransaction(adapter, () =>
+        harness.auth.api.testInTransaction(),
+      ),
+    ).toEqual({ inTransaction: true });
   });
 
   it("negative control: expectNoOuterCalls catches a direct ctx.context.adapter call", async () => {
