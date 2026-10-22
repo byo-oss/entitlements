@@ -15,6 +15,8 @@ export type UsageMeterProps<C extends AnyCatalog = AnyCatalog> = {
   className?: string;
   /** Classes on the filled bar. */
   barClassName?: string;
+  /** Classes appended to the text line's defaults. */
+  textClassName?: string;
   /** Overrides any default string. */
   labels?: Partial<UsageMeterLabels>;
 };
@@ -38,6 +40,10 @@ function periodOf(catalog: AnyCatalog | undefined, key: string) {
  * `text-muted-foreground`) with `role="progressbar"`, `aria-valuenow`,
  * `aria-valuemin`, `aria-valuemax` and `aria-valuetext`.
  *
+ * The text line is a polite live region (`aria-live="polite"`,
+ * `aria-atomic="true"`), so a changed count is announced; `textClassName`
+ * adds classes to it.
+ *
  * For an `"unlimited"` limit the bar stays empty and `aria-valuemax` equals
  * the amount used (at least 1), so the values stay valid.
  */
@@ -47,7 +53,7 @@ export function UsageMeter<C extends AnyCatalog = AnyCatalog>(
   const { entitlements, limitKey, catalog, className, barClassName } = props;
   const labels: UsageMeterLabels = { ...defaultLabels, ...props.labels };
   const outer = join("w-full space-y-1", className);
-  const text = "text-sm text-muted-foreground";
+  const text = join("text-sm text-muted-foreground", props.textClassName);
 
   const usage = entitlements.usage(limitKey);
   const limit = entitlements.limit(limitKey);
@@ -72,7 +78,9 @@ export function UsageMeter<C extends AnyCatalog = AnyCatalog>(
             aria-valuetext={labels.loading}
             className="h-2 w-full overflow-hidden rounded-full bg-muted"
           />
-          <p className={text}>{labels.loading}</p>
+          <p className={text} aria-live="polite" aria-atomic="true">
+            {labels.loading}
+          </p>
         </div>
       );
     }
@@ -106,7 +114,9 @@ export function UsageMeter<C extends AnyCatalog = AnyCatalog>(
           style={{ width: `${percent}%` }}
         />
       </div>
-      <p className={text}>{valueText}</p>
+      <p className={text} aria-live="polite" aria-atomic="true">
+        {valueText}
+      </p>
     </div>
   );
 }

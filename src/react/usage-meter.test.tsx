@@ -124,6 +124,30 @@ describe("UsageMeter", () => {
     expect(container.querySelector(".text-muted-foreground")).not.toBeNull();
   });
 
+  it("appends textClassName to the text line's default classes", () => {
+    render(
+      <UsageMeter
+        entitlements={entitlements()}
+        limitKey="apiCalls"
+        textClassName="font-medium"
+      />,
+    );
+    const line = screen.getByText("920 of 1,000 API calls used");
+    expect(line.className).toContain("text-sm");
+    expect(line.className).toContain("text-muted-foreground");
+    expect(line.className).toContain("font-medium");
+  });
+
+  it("makes the text line a polite live region and keeps the aria values", () => {
+    render(<UsageMeter entitlements={entitlements()} limitKey="apiCalls" />);
+    const line = screen.getByText("920 of 1,000 API calls used");
+    expect(line.getAttribute("aria-live")).toBe("polite");
+    expect(line.getAttribute("aria-atomic")).toBe("true");
+    const bar = screen.getByRole("progressbar");
+    expect(bar.getAttribute("aria-valuenow")).toBe("920");
+    expect(bar.getAttribute("aria-valuemax")).toBe("1000");
+  });
+
   it("clamps the value when usage is over the limit", () => {
     render(
       <UsageMeter
