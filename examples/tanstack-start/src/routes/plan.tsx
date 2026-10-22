@@ -6,7 +6,7 @@ import {
 import type { LimitKey } from "@byo-oss/entitlements/catalog";
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
-import { callApi, exportData } from "../lib/actions";
+import { callApi, exportData, simulateCheckout } from "../lib/actions";
 import { authClient } from "../lib/auth-client";
 import { type AppCatalog, catalog, meteredKeys } from "../lib/catalog";
 import { CUSTOMER_ORGANIZATION_ID } from "../lib/constants";
@@ -51,11 +51,22 @@ function Plan({ organizationId }: { organizationId: string }) {
                 <th scope="row" style={{ textAlign: "left", paddingRight: 16 }}>
                   {key}
                 </th>
-                <td>{String(entitlements.limit(key) ?? "…")}</td>
+                <td data-testid={`limit-${key}`}>{String(entitlements.limit(key) ?? "…")}</td>
               </tr>
             ))}
           </tbody>
         </table>
+        {plan?.key === "pro" ? null : (
+          <button
+            type="button"
+            onClick={async () => {
+              await simulateCheckout({ data: { organizationId } });
+              await entitlements.refresh();
+            }}
+          >
+            Simulate checkout to Pro
+          </button>
+        )}
       </section>
 
       <section style={{ display: "grid", gap: 8 }}>

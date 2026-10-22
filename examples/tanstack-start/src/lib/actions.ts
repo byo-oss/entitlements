@@ -1,6 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { getRequestHeaders } from "@tanstack/react-start/server";
 import { auth, entitlements } from "./auth";
+import { checkoutToPro } from "./demo-source";
 
 type OrganizationInput = { organizationId: string };
 
@@ -63,4 +64,19 @@ export const callApi = createServerFn({ method: "POST" })
       resetAt: result.resetAt.toISOString(),
       upgradeTo: result.upgradeTo,
     };
+  });
+
+/**
+ * Stands in for a completed checkout: the demo billing source now reports
+ * Pro for the organization and calls `changed`, which resyncs its snapshot
+ * (what a real source's webhook does). The page then calls `refresh()`,
+ * which runs `refreshEntitlements`, as an app does on return from checkout.
+ */
+export const simulateCheckout = createServerFn({ method: "POST" })
+  .validator(validateOrganization)
+  .handler(async ({ data }) => {
+    await requireMember(data.organizationId);
+    await auth.$context; // the plugin connects the source at boot
+    await checkoutToPro(data.organizationId);
+    return { ok: true };
   });

@@ -5,6 +5,7 @@ import { organization } from "better-auth/plugins/organization";
 import { ac, roles } from "./access.ts";
 import { catalog } from "./catalog.ts";
 import { STAFF_ORGANIZATION_ID } from "./constants.ts";
+import { demoSource } from "./demo-source.ts";
 
 // Setup step 1: the catalog and the plugin. Shared with scripts/migrate.ts,
 // scripts/seed.ts and scripts/export-and-uninstall.ts, which run under plain
@@ -15,9 +16,13 @@ export const authOptions = {
   emailAndPassword: { enabled: true },
   plugins: [
     organization({ ac, roles }), // before entitlements(): tables are created in plugin order
-    // No `source`: every organization is on the catalog's `defaultPlan` (Free)
-    // plus its overrides. Production apps pass a real source, such as
+    // `demoSource` is an in-memory stand-in for a billing provider (see
+    // demo-source.ts). Production apps pass a real source, such as
     // `fromBetterAuthStripe()` from `@byo-oss/entitlements/stripe`.
-    entitlements({ catalog, staffOrganizationId: STAFF_ORGANIZATION_ID }),
+    entitlements({
+      catalog,
+      source: demoSource,
+      staffOrganizationId: STAFF_ORGANIZATION_ID,
+    }),
   ],
 } satisfies BetterAuthOptions;
