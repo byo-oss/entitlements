@@ -56,7 +56,7 @@ Work through these in order. Each step ends on a check; move on only when it hol
 - **Check a count:** `await gate.checkCapacity(orgId, "members", { count })` before creating the row. The count is the app's; two concurrent creates can both pass, so lock the organization row in a transaction if that matters.
 - **Read a setting:** `await gate.getLimit(orgId, "retentionDays")`.
 - **After checkout:** call `refreshEntitlements` (`authClient.entitlements.refresh({ organizationId })`, or the hook's `refresh()`) when the user returns, because the webhook may arrive later.
-- **UI:** `useEntitlements`, `EntitlementGate` and `UsageMeter` from `@byo-oss/entitlements/react`. Tailwind v4 skips `node_modules`: add `@source "<relative path>/node_modules/@byo-oss/entitlements/dist";` to the CSS file that imports Tailwind.
+- **UI:** `useEntitlements`, `EntitlementGate` and `UsageMeter` from `@byo-oss/entitlements/react`. The gate treats a feature as off while loading, so return `null` from `fallback` when `isLoading` is true (no upgrade flash). Tailwind v4 skips `node_modules`: add `@source "<relative path>/node_modules/@byo-oss/entitlements/dist";` to the CSS file that imports Tailwind.
 
   ```tsx
   // components/exports.tsx
@@ -72,7 +72,9 @@ Work through these in order. Each step ends on a check; move on only when it hol
           entitlements={entitlements}
           feature="exports"
           catalog={catalog}
-          fallback={({ upgradeTo }) => <a href="/billing">Upgrade to {upgradeTo[0]}</a>}
+          fallback={({ upgradeTo, isLoading }) =>
+            isLoading ? null : <a href="/billing">Upgrade to {upgradeTo[0]}</a>
+          }
         >
           <button type="button">Export</button>
         </EntitlementGate>
@@ -89,8 +91,9 @@ Work through these in order. Each step ends on a check; move on only when it hol
 - Every duration option is in milliseconds, except `pastDueGraceDays` (days). Floors: `maxAge` 60000, `usageRetention` and `overrideRetention` 86400000. A value in the wrong unit fails boot.
 - `consumeUsage`, `sync(orgId)` and `refreshEntitlements` throw inside a transaction; call them outside. Reads and `checkCapacity` work inside one, and the sweep (`processEntitlementsSync`, `byo.sweep`) joins it. Events fire when the adapter write returns (the public `better-auth` entry has no after-commit hook), so inside a transaction one can announce a write that rolls back.
 - Never rename a plan key that has subscribers; map the old key with `planAliases`.
+- A limit of 0 means "not included": `getLimit`, `consumeUsage` and `checkCapacity` all answer `not_in_plan`. `upgradeTo` never names the current plan. Results are frozen; copy before changing.
 - The default `acceptSession` refuses impersonated sessions (`session.session.impersonatedBy`) on staff calls and POSTs, and nothing else. Refusing API-key or bearer sessions on the override endpoints is an app choice; a custom `acceptSession` replaces the default, so it keeps the impersonation rule and adds its own.
-- Deleting an organization through `/organization/delete` cleans up by itself. Deletes made another way call `deleteOrganizationData(auth, organizationId)`.
+- Deleting an organization through `/organization/delete` cleans up by itself. Deletes made another way call `deleteOrganizationData(auth, organizationId)`. To run the cleanup yourself, set `organizationCleanup: false` and call it from `organization({ organizationHooks: { afterDeleteOrganization: async ({ organization }): Promise<void> => { await deleteOrganizationData(auth, organization.id) } } })`; the README's Lifecycle section has the full sample.
 - Route `entitlements.usage.limit_reached` from `onEvent` to `auth.api.notify` when the app uses `@byo-oss/notifications`. `notify` exists only with its `inbox()` plugin installed; pass the event's `type` as the notification `type`. The README has the full sample.
 
 ## Another billing provider

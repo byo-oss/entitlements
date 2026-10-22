@@ -129,8 +129,9 @@ export async function examples(orgId: string, orgIds: string[]) {
 
 - reason: "ok" | "not_in_plan" | "limit_reached" | "error".
 - consumeUsage is one guarded incrementOne: atomic, refusals never count (used unchanged, refused +1), firstRefusal is true once per period (emits limit_reached). amount is a positive integer.
-- getLimit: limit 0 → not_in_plan; metered remaining 0 → limit_reached. checkCapacity: allowed = count + adding <= limit; over = count > limit (a downgraded org). Two concurrent creates can both pass checkCapacity: lock the organization row (SELECT … FOR UPDATE) in the transaction that counts and creates.
-- Failure policy: reads never throw for an outage. A throwing db/source/resolveEntitlements hook → get/getMany/getLimit answer defaultPlan with degraded: true; hasFeature/consumeUsage/checkCapacity answer onError(error, { organizationId, key, operation }) ("deny" by default) with reason "error". One log line per failure. An id that is not an organization answers defaultPlan, not degraded, and writes nothing.
+- A limit of 0 means not included: getLimit, consumeUsage and checkCapacity all answer reason "not_in_plan" (a metered refusal still counts toward refused, and the first one in a period emits limit_reached). A metered key with remaining 0 → limit_reached. upgradeTo never names the org's current plan. Results are read-only (frozen): copy before changing.
+- checkCapacity: allowed = count + adding <= limit; over = count > limit (a downgraded org). Two concurrent creates can both pass checkCapacity: lock the organization row (SELECT … FOR UPDATE) in the transaction that counts and creates.
+- Failure policy: reads never throw for an outage. A throwing db/source/resolveEntitlements hook → get/getMany/getLimit answer defaultPlan with degraded: true; hasFeature/consumeUsage/checkCapacity answer onError(error, { organizationId, key, operation }) ("deny" by default) with reason "error". One log line per failure. An id that is not an organization answers defaultPlan, not degraded, and writes nothing (consumeUsage refuses it with not_in_plan and creates no counter).
 - Bad arguments THROW (programmer errors, never refusals; the server API types reject typos at compile time): a wrong-kind or unknown key from an untyped caller throws "[@byo-oss/entitlements] UNKNOWN_KEY: …"; an invalid amount throws "[@byo-oss/entitlements] consumeUsage: amount must be a positive integer"; an invalid count or adding throws "[@byo-oss/entitlements] checkCapacity: count and adding must be non-negative integers". Only the first carries the UNKNOWN_KEY code; the other two are plain Errors.
 
 A 429 for a refused call:
@@ -151,7 +152,7 @@ export async function guardApiCall(organizationId: string): Promise<Response | n
 
 ## Options (every duration is in ms except pastDueGraceDays)
 
-catalog (required) · source (BillingSource; unset → everyone on defaultPlan + overrides) · isEntitled(snapshot, now) (default: active, trialing, past_due within grace) · pastDueGraceDays 7 (days, counted from pastDueSince) · resolveEntitlements({ organizationId, plan, snapshot, features, limits }) → { features?, limits? } (replaces keys; after a plan override, before feature/limit overrides) · staffOrganizationId · authorize({ session, headers, organizationId, permissions }) · acceptSession({ session, headers, kind: "member"|"staff", method, path }) (default refuses impersonated sessions on staff calls and POSTs, and nothing else; a custom one replaces it) · onEvent(event) · onError(error, { organizationId, key, operation }) default deny · cacheTtlMs 30000 (0 = off; max 10000 orgs) · maxAge 3600000 (≥60000) · usageRetention 7776000000 (≥86400000) · overrideRetention 31536000000 (≥86400000) · organizationCleanup true · maxAttempts 5 · batchSize 100 (1-1000) · leaseMs 300000 · schema (rename tables/columns).
+catalog (required) · source (BillingSource; unset → everyone on defaultPlan + overrides) · isEntitled(snapshot, now) (default: active, trialing, past_due within grace) · pastDueGraceDays 7 (days, counted from pastDueSince) · resolveEntitlements({ organizationId, plan, snapshot, features, limits }) → { features?, limits? } (replaces keys; after a plan override, before feature/limit overrides) · staffOrganizationId · authorize({ session, headers, organizationId, permissions }) · acceptSession({ session, headers, kind: "member"|"staff", method, path }) (default refuses impersonated sessions on staff calls and POSTs, and nothing else; a custom one replaces it) · onEvent(event) · onError(error, { organizationId, key, operation }) default deny · cacheTtlMs 30000 (0 = off; max 10000 orgs) · maxAge 3600000 (≥60000) · usageRetention 7776000000 (≥86400000) · overrideRetention 31536000000 (≥86400000) · organizationCleanup true · maxAttempts 5 · batchSize 100 (1-1000; one budget per sweep call, shared by its steps: resyncs, override expiry, pruning) · leaseMs 300000 · schema (rename tables/columns).
 
 - a value in the wrong unit (overrideRetention: 365) fails boot. Boot errors are prefixed [@byo-oss/entitlements]. No organization plugin → ORGANIZATION_PLUGIN_REQUIRED. No staffOrganizationId and no authorize → one warning; override endpoints deny.
 - Refusing API-key or bearer callers on the override endpoints is an app choice, not the default. A custom acceptSession keeps the impersonation rule and adds its own:
@@ -293,7 +294,8 @@ testBillingSource({
 
 - push (source events) · read-through (first read writes a snapshot, also with no subscription) · background refresh past maxAge (context.runInBackground when advanced.backgroundTasks.handler is set, else marked due for the sweep) · sweep · refreshEntitlements after checkout.
 - The sweep claims due snapshots with a lease, resolves, backs off 1 min doubling (cap maxAge), marks overrides past expiresAt "expired", prunes usage (usageRetention) and ended overrides (overrideRetention). After maxAttempts a snapshot counts failed, keeps its last good state and retries at maxAge. Without a source only expiry and pruning run. @byo-oss/core's sweepAll(auth) runs it with the other BYO plugins.
-- Staleness across processes: each process caches up to cacheTtlMs (30s); it clears its own entry on its own writes and on invalidate(). Another process's write can show up cacheTtlMs late. refreshEntitlements is always fresh. Usage counters are never cached.
+- Delivery: sweeps are at-least-once. A lease that expires (leaseMs) while a slow sweep is still working lets a second sweep claim the same row and both resync it; harmless, because a resync writes absolute state. Syncs write absolute state; events are best-effort, at most once, in-process.
+- Staleness across processes: each process caches up to cacheTtlMs (30s); it clears its own entry on its own writes and on invalidate(). Another process's write can show up cacheTtlMs late. refreshEntitlements returns the latest state: a lost concurrent write is retried up to 3 times, then it answers 503 ENTITLEMENTS_UNAVAILABLE (a Stripe push that loses the same way answers 400, so Stripe redelivers). Usage counters are never cached.
 - incrementOne atomicity: Kysely/Drizzle re-apply the guard on the UPDATE from better-auth 1.7.7 (exact); memory, Prisma, MongoDB native (exact); a custom adapter without incrementOne uses core's fallback (prior-value guard, 5 tries, then throws → onError denies under contention).
 
 ```ts
@@ -316,7 +318,7 @@ export async function sweep(): Promise<void> {
 - consumeUsage, sync(orgId) and refreshEntitlements THROW "[@byo-oss/entitlements] <name> must run outside a transaction": call them before/after.
 - processEntitlementsSync, byo.sweep and @byo-oss/core's sweepAll JOIN the transaction and roll back with it: the sweep only updates and deletes existing rows, so it cannot abort the caller's transaction with a create conflict. Their plan.changed events are emitted before the caller commits.
 - Inside a joined transaction the cache entry is cleared before the commit, so a read made outside the transaction in that window can re-cache the old state until cacheTtlMs. Override writes made inside a transaction behave the same way.
-- On Postgres, a database error inside a joined sweep aborts the caller's transaction: the sweep reports retrying and the caller's commit then fails. Run sweeps outside app transactions unless you want them to roll back together.
+- On Postgres, a database error inside a joined sweep aborts the caller's transaction: the sweep call rejects (it does not report retrying) and the caller's commit then fails. Run sweeps outside app transactions unless you want them to roll back together.
 - Override writes join the transaction too and roll back with it.
 - Events fire when the adapter write returns, not after commit: the public better-auth entry exports no after-commit hook, so in 0.1.0 an event emitted inside a caller's transaction (an override write, a sweep) can announce a write that rolls back. After-commit is a follow-up.
 
@@ -403,6 +405,30 @@ Tailwind v4 skips node_modules: add `@source "<path>/node_modules/@byo-oss/entit
 ## Lifecycle, export, uninstall
 
 - organizationCleanup (default true) deletes an org's rows after /organization/delete. organizationCleanup: false → SQL cascades via FKs, memory/MongoDB keep rows until you call deleteOrganizationData. User delete nulls createdBy/removedBy on overrides.
+- To run the cleanup yourself (SPEC 6.2), turn the automatic one off and wire deleteOrganizationData into the organization plugin's hook. Use it when you want the cleanup under your control or turned the automatic hook off; for deletes that never go through the organization plugin call deleteOrganizationData directly (purgeOrganization below).
+
+```ts
+// lib/auth-cleanup.ts
+import { betterAuth } from "better-auth"
+import { organization } from "better-auth/plugins/organization"
+import { deleteOrganizationData, entitlements } from "@byo-oss/entitlements"
+import { catalog } from "./catalog"
+
+export const auth = betterAuth({
+  plugins: [
+    organization({
+      organizationHooks: {
+        // annotate the return type so TypeScript doesn't infer `auth` from itself
+        afterDeleteOrganization: async ({ organization }): Promise<void> => {
+          await deleteOrganizationData(auth, organization.id)
+        },
+      },
+    }),
+    entitlements({ catalog, organizationCleanup: false }),
+  ],
+})
+```
+
 - exportEntitlementsData: limit 1-1000; offset paging over id, so a row deleted mid-export can shift later rows; one model per page (page.snapshots, page.overrides with createdByEmail and removedByEmail, page.usage). The catalog is not exported.
 - Uninstall: remove the plugin, then drop entitlementUsage, entitlementOverride, entitlementSnapshot (in that order; none references another).
 

@@ -181,7 +181,7 @@ Every duration is in milliseconds except `pastDueGraceDays` (days). A value give
 | `overrideRetention` | `31536000000` (365 days) | The sweep deletes removed or expired overrides that ended longer ago. Integer, **at least 86400000** (1 day). `overrideRetention: 365` fails boot. |
 | `organizationCleanup` | `true` | Delete an organization's rows after `/organization/delete`. |
 | `maxAttempts` | `5` | Resolve attempts before a snapshot is counted `failed` (it keeps its last good state). Integer, at least 1. |
-| `batchSize` | `100` | Snapshots claimed per sweep call. Integer, 1 to 1000. |
+| `batchSize` | `100` | Rows one sweep call works through: a single budget shared by its steps (resyncs, override expiry, pruning), not one per step. Integer, 1 to 1000. |
 | `leaseMs` | `300000` (5 minutes) | How long a sweep claim lasts before another sweep may take it. Integer, at least 1. |
 | `schema` | none | Rename tables and columns (better-auth's `mergeSchema`). |
 
@@ -263,6 +263,12 @@ The client exposes them as `client.entitlements.get({ query })`, `.refresh({ org
 
 Only the first carries the `UNKNOWN_KEY` code; the other two are plain `Error`s with those messages.
 
+Result rules:
+
+- A limit of 0 means "not included": `getLimit`, `consumeUsage` and `checkCapacity` all answer `reason: "not_in_plan"`. A metered refusal still counts toward `refused`, and the first one in a period emits `limit_reached`.
+- `upgradeTo` never names the organization's current plan, only plans that would unlock the feature or limit.
+- Results are read-only (frozen). Copy one before changing it.
+
 ```ts
 // lib/guard.ts (server only)
 import { gate } from "./gate"
@@ -278,7 +284,7 @@ export async function guardApiCall(organizationId: string): Promise<Response | n
 }
 ```
 
-**Failure policy.** When the database, the billing source or your `resolveEntitlements` hook throws, `get`, `getMany` and `getLimit` answer from `defaultPlan` with `degraded: true`, and `hasFeature`, `consumeUsage` and `checkCapacity` answer what `onError` says, with `reason: "error"`. Each failure is logged once. An id that isn't an organization answers `defaultPlan` without `degraded` and writes nothing.
+**Failure policy.** When the database, the billing source or your `resolveEntitlements` hook throws, `get`, `getMany` and `getLimit` answer from `defaultPlan` with `degraded: true`, and `hasFeature`, `consumeUsage` and `checkCapacity` answer what `onError` says, with `reason: "error"`. Each failure is logged once. An id that isn't an organization answers `defaultPlan` without `degraded` and writes nothing; `consumeUsage` refuses it with `not_in_plan` and creates no counter.
 
 **Capacity race.** `checkCapacity` compares a count you supply, so two concurrent creates can both pass. To close it, lock a parent row (`SELECT … FOR UPDATE` on the organization) inside the transaction that counts and creates, or use SERIALIZABLE. After a downgrade `over` is true while `count > limit`, so a UI can show the organization above its new limit; nothing is deleted.
 
@@ -378,7 +384,9 @@ export function Exports({ organizationId }: { organizationId: string }) {
         entitlements={entitlements}
         feature="exports"
         catalog={catalog}
-        fallback={({ upgradeTo }) => <a href="/billing">Upgrade to {upgradeTo[0]}</a>}
+        fallback={({ upgradeTo, isLoading }) =>
+          isLoading ? null : <a href="/billing">Upgrade to {upgradeTo[0]}</a>
+        }
       >
         <ExportButton />
       </EntitlementGate>
@@ -389,7 +397,7 @@ export function Exports({ organizationId }: { organizationId: string }) {
 ```
 
 - `useEntitlements` returns `{ data, isLoading, error, hasFeature(key), limit(key), usage(key), refresh() }`. `refresh()` calls `refreshEntitlements`; use it on return from checkout.
-- `EntitlementGate` renders `children` when the feature is on, else `fallback(result)`; the result carries `upgradeTo` when you pass `catalog`. It renders no markup of its own.
+- `EntitlementGate` renders `children` when the feature is on, else `fallback(result)`; the result carries `upgradeTo` when you pass `catalog`, and `isLoading`. The feature counts as off while loading, so return `null` for `isLoading` as above, or a signed-in organization sees an upgrade prompt flash before its plan arrives. It renders no markup of its own.
 - `UsageMeter` renders a `role="progressbar"` with `aria-valuenow`, `aria-valuemin`, `aria-valuemax` and an `aria-valuetext` such as "920 of 1,000 API calls used today". It uses shadcn tokens (`bg-muted`, `bg-primary`, `text-muted-foreground`); `className` styles the wrapper and `barClassName` the bar. `labels` overrides every string (`usage`, `loading`, `error`); the defaults are in `defaultLabels`.
 - There are no router links and no repeated elements, so there is no `onNavigate` or `renderItem`.
 - Tailwind v4 skips `node_modules`. Add this to the CSS file that imports Tailwind, with the path relative to that file:
@@ -526,7 +534,7 @@ The billing provider is the source of truth; the snapshot is a cache of it. It i
 4. **Sweep.** Call `auth.api.processEntitlementsSync()` from a cron (every minute is fine) and again while `hasMore` is true, or let `sweepAll(auth)` from `@byo-oss/core` run every installed BYO plugin. It claims due snapshots with a lease, resolves them, backs off (1 minute, doubling, capped at `maxAge`) on a throwing source, marks overrides past `expiresAt` as `expired`, and prunes old usage and override rows. After `maxAttempts` a snapshot counts as `failed`: it keeps its last good state and is retried at the normal pace, never frozen. Without a `source` only expiry and pruning run.
 5. **Refresh after checkout.** `refreshEntitlements` always bypasses the cache and syncs now. Call it when the user returns from checkout, because the webhook may arrive later. Writes the Stripe plugin makes outside its webhook (the `/subscription/success` redirect, upgrade, cancel) are picked up by the next of these.
 
-**Staleness across processes.** Each process caches resolved entitlements for up to `cacheTtlMs` (default 30 seconds) and clears its own entry on its own writes (sync, override) and on `invalidate`. A write made in another process can therefore show up here up to `cacheTtlMs` late. `refreshEntitlements` is never stale. Set `cacheTtlMs: 0` to read through every time, and call `invalidate(orgId)` when an app-side input to `resolveEntitlements` changes. Usage counters are never cached.
+**Staleness across processes.** Each process caches resolved entitlements for up to `cacheTtlMs` (default 30 seconds) and clears its own entry on its own writes (sync, override) and on `invalidate`. A write made in another process can therefore show up here up to `cacheTtlMs` late. `refreshEntitlements` returns the latest state: when a concurrent write wins the race, it re-reads and retries up to 3 times, then answers 503 `ENTITLEMENTS_UNAVAILABLE`. A Stripe push that loses the same way answers 400, so Stripe redelivers. Set `cacheTtlMs: 0` to read through every time, and call `invalidate(orgId)` when an app-side input to `resolveEntitlements` changes. Usage counters are never cached.
 
 **`incrementOne` atomicity.** `consumeUsage` is one `incrementOne` guarded on `used <= limit - amount`, so the count and the limit check happen in one statement.
 
@@ -546,36 +554,60 @@ Every function and endpoint reads and writes through better-auth's `getCurrentAd
 - `consumeUsage`, `sync(orgId)` and `refreshEntitlements` throw `[@byo-oss/entitlements] <name> must run outside a transaction`, because a bucket or snapshot create could abort your transaction and a consumption rolled back with it would be invisible to others. Call them before or after the transaction.
 - `processEntitlementsSync`, `byo.sweep` and `@byo-oss/core`'s `sweepAll` join your transaction instead of throwing, and roll back with it: the sweep only updates and deletes existing rows, so it can't abort the transaction with a create conflict. Their `plan.changed` events are emitted before you commit.
   - Inside a joined transaction the cache entry is cleared before the commit, so a read made outside the transaction in that window can re-cache the old state until `cacheTtlMs`. Override writes made inside a transaction behave the same way.
-  - On Postgres, a database error inside a joined sweep aborts your transaction: the sweep reports `retrying` and your commit then fails. Run sweeps outside app transactions unless you want them to roll back together.
+  - On Postgres, a database error inside a joined sweep aborts your transaction, so the sweep rejects (it does not report `retrying`) and your commit then fails. Run sweeps outside app transactions unless you want them to roll back together.
 - Override writes (`setEntitlementOverride`, `removeEntitlementOverride`) join the transaction and roll back with it.
 - **Events fire before you commit.** The public `better-auth` entry exports no after-commit hook, so 0.1.0 emits an event when the adapter write returns. Inside a caller's transaction (an override write, or a sweep) an event can therefore announce a write that later rolls back. Emitting after commit is a follow-up.
 - The source's `resolve` receives the current adapter.
+
+## Lifecycle
+
+Deleting an organization through `/organization/delete` removes its usage rows, overrides and snapshot (`organizationCleanup`, on by default). To run the cleanup yourself, turn that off and wire `deleteOrganizationData` into the organization plugin's hook (SPEC 6.2):
+
+```ts
+// lib/auth-cleanup.ts
+import { betterAuth } from "better-auth"
+import { organization } from "better-auth/plugins/organization"
+import { deleteOrganizationData, entitlements } from "@byo-oss/entitlements"
+import { catalog } from "./catalog"
+
+export const auth = betterAuth({
+  plugins: [
+    organization({
+      organizationHooks: {
+        // annotate the return type so TypeScript doesn't infer `auth` from itself
+        afterDeleteOrganization: async ({ organization }): Promise<void> => {
+          await deleteOrganizationData(auth, organization.id)
+        },
+      },
+    }),
+    entitlements({ catalog, organizationCleanup: false }),
+  ],
+})
+```
+
+Use this wiring when you want the cleanup under your control (for example to run it with your other organization teardown), or when you turned the automatic hook off. For deletes that never go through the organization plugin, call `deleteOrganizationData(auth, organizationId)` yourself:
+
+```ts
+// lib/purge.ts (server only)
+import { deleteOrganizationData } from "@byo-oss/entitlements"
+import { auth } from "./auth"
+
+export async function purgeOrganization(organizationId: string): Promise<void> {
+  await deleteOrganizationData(auth, organizationId)
+}
+```
+
+- With `organizationCleanup: false` and no hook, SQL adapters still cascade through the foreign keys; the memory adapter and MongoDB keep the rows until `deleteOrganizationData` runs.
+- Deleting a user clears `createdBy` and `removedBy` on overrides (a hook, so memory and MongoDB match SQL's `set null`). Overrides keep their author after that person leaves the staff organization.
+- Nothing is stored per member, so there is no member cleanup.
 
 ## Delivery guarantees
 
 - **Syncs** write absolute state, so a repeat is harmless.
 - **`consumeUsage`** counts exactly once per call that returns `allowed`, and refusals never count. A caller that retries a call it believes failed can count twice; v0 has no idempotency key.
 - **Events** are best-effort and at most once, in-process. An `onEvent` that throws is logged and never fails the call.
-- **Sweeps** are at-least-once with an atomic claim and a lease; two sweeps never both own a row.
+- **Sweeps** are at-least-once. Each row is claimed atomically with a lease, but a lease that expires (`leaseMs`) while a slow sweep is still working lets a second sweep claim the same row, and both resync it. That duplicate is harmless: a resync writes absolute state.
 - **Lifecycle cleanup** failures are logged without failing the response; run `deleteOrganizationData` to retry.
-
-### Lifecycle
-
-- Deleting an organization through `/organization/delete` removes its usage rows, overrides and snapshot (`organizationCleanup`, on by default). For deletes made another way, call `deleteOrganizationData(auth, organizationId)`, for example:
-
-  ```ts
-  // lib/purge.ts (server only)
-  import { deleteOrganizationData } from "@byo-oss/entitlements"
-  import { auth } from "./auth"
-
-  export async function purgeOrganization(organizationId: string): Promise<void> {
-    await deleteOrganizationData(auth, organizationId)
-  }
-  ```
-
-- With `organizationCleanup: false`, SQL adapters still cascade through the foreign keys; the memory adapter and MongoDB keep the rows until `deleteOrganizationData` runs.
-- Deleting a user clears `createdBy` and `removedBy` on overrides (a hook, so memory and MongoDB match SQL's `set null`). Overrides keep their author after that person leaves the staff organization.
-- Nothing is stored per member, so there is no member cleanup.
 
 ## Outgrowing this
 

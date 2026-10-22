@@ -16,7 +16,7 @@ Optional: render `useEntitlements`, `EntitlementGate` and `UsageMeter` from `@by
 
 ## Rules
 
-- Gate with `createEntitlements` (`hasFeature`, `getLimit`, `consumeUsage`, `checkCapacity`), never by reading the plugin's tables or comparing plan names. Checks return `{ allowed, reason, upgradeTo }`; build the refusal from that.
+- Gate with `createEntitlements` (`hasFeature`, `getLimit`, `consumeUsage`, `checkCapacity`), never by reading the plugin's tables or comparing plan names. Checks return `{ allowed, reason, upgradeTo }`; build the refusal from that. A limit of 0 answers `not_in_plan` everywhere, `upgradeTo` never names the current plan, and results are frozen.
 - `consumeUsage`, `sync(orgId)` and `refreshEntitlements` throw inside a transaction. Call them before or after it. Reads and `checkCapacity` work inside one, and the sweep (`processEntitlementsSync`, `byo.sweep`) joins it. Events fire when the adapter write returns, so inside a transaction one can announce a write that rolls back.
 - Every duration option is in milliseconds except `pastDueGraceDays`. `maxAge` must be at least 60000; `usageRetention` and `overrideRetention` at least 86400000.
 - Never rename a plan key that has subscribers; add a `planAliases` entry. Prices live in Stripe, not the catalog.
@@ -34,7 +34,7 @@ Optional: render `useEntitlements`, `EntitlementGate` and `UsageMeter` from `@by
     return true
   }
   ```
-- Deleting organizations outside `/organization/delete` needs `deleteOrganizationData(auth, organizationId)`. Export with `exportEntitlementsData`, looping on `nextCursor`.
+- Deleting organizations outside `/organization/delete` needs `deleteOrganizationData(auth, organizationId)`. To run the cleanup yourself, set `organizationCleanup: false` and call it from `organizationHooks.afterDeleteOrganization` (README, Lifecycle). Export with `exportEntitlementsData`, looping on `nextCursor`.
 - A billing provider other than Stripe is a `BillingSource` (`byo-entitlements-<provider>`). Test it with `testBillingSource` from `@byo-oss/entitlements/testing`.
 
 ## Working on this repo
