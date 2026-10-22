@@ -1,3 +1,4 @@
+import { sweepAll } from "@byo-oss/core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createEntitlements } from "./api";
 import type { entitlements } from "./index";
@@ -23,6 +24,7 @@ import {
   type TestAuthConfig,
   testCatalog,
 } from "./test-utils";
+import { currentAdapter } from "./txn";
 import type { BillingState } from "./types";
 
 // PRD #17 (the sweep), #10 (its pastDueSince half), memory lane
@@ -961,17 +963,187 @@ describe("processEntitlementsSync and byo.sweep", () => {
     expect(await plugin.byo.sweep(t.auth)).toMatchObject({ synced: 1 });
     expect((await snapshotOf(t.auth, organizationId))?.planKey).toBe("team");
   });
+});
 
-  it("must run outside a transaction", async () => {
-    const t = await setup();
+// ---------------------------------------------------------------------------
+// Inside a caller's transaction (PRD A4): the sweep joins it
+// ---------------------------------------------------------------------------
+
+type Setup = Awaited<ReturnType<typeof setup>>;
+
+/**
+ * Work for every sweep step: two due snapshots (the source answers `pro`
+ * and `team`), one live override past `expiresAt` and one usage counter
+ * past `usageRetention`.
+ */
+async function seedSweepWork(t: Setup) {
+  const orgs: string[] = [];
+  for (const planKey of ["pro", "team"]) {
     const { organizationId } = await seedOrg(t.auth);
     await setSnapshot(t.auth, organizationId, due());
-    await expectNoOuterCalls(t.auth, async () => {
-      await expect(runSync(t.rt)).rejects.toThrow(
-        "[@byo-oss/entitlements] processEntitlementsSync must run outside a transaction",
-      );
+    t.source.states.set(organizationId, active(planKey));
+    orgs.push(organizationId);
+  }
+  const [first] = orgs as [string, string];
+  const lapsed = await seedOverride(t.auth, {
+    organizationId: first,
+    kind: "feature",
+    key: "sso",
+    permanent: false,
+    expiresAt: at(NOW, -HOUR),
+  });
+  const { usageRetention } = t.rt.options;
+  const oldUsage = await seedUsage(t.auth, {
+    organizationId: first,
+    key: "uploads",
+    periodStart: at(NOW, -usageRetention - 31 * DAY),
+    periodEnd: at(NOW, -usageRetention - DAY),
+    used: 4,
+  });
+  const before = [];
+  for (const id of orgs) before.push(await snapshotOf(t.auth, id));
+  return { orgs, lapsed, oldUsage, before };
+}
+
+type SweepWork = Awaited<ReturnType<typeof seedSweepWork>>;
+
+/** Reads through the transaction's adapter (an outer read would fail `expectNoOuterCalls`). */
+async function readInside(t: Setup, work: SweepWork) {
+  const adapter = await currentAdapter(t.rt);
+  const snapshots = [];
+  for (const id of work.orgs) {
+    snapshots.push(
+      await adapter.findOne<EntitlementSnapshotRow>({
+        model: "entitlementSnapshot",
+        where: [{ field: "organizationId", value: id }],
+      }),
+    );
+  }
+  const override = await adapter.findOne<EntitlementOverrideRow>({
+    model: "entitlementOverride",
+    where: [{ field: "id", value: work.lapsed.id }],
+  });
+  const usage = await adapter.findOne<EntitlementUsageRow>({
+    model: "entitlementUsage",
+    where: [{ field: "id", value: work.oldUsage.id }],
+  });
+  return { adapter, snapshots, override, usage };
+}
+
+/** Inside the transaction: the sweep's writes are visible, and the source got the transaction's adapter. */
+async function expectSweptInside(t: Setup, work: SweepWork) {
+  const inside = await readInside(t, work);
+  const outer = (await getContext(t.auth)).adapter;
+  expect(inside.adapter).not.toBe(outer);
+  expect(t.source.calls).toHaveLength(2);
+  for (const call of t.source.calls) expect(call.adapter).toBe(inside.adapter);
+  expect(inside.snapshots.map((row) => row?.planKey)).toEqual(["pro", "team"]);
+  for (const [i, row] of inside.snapshots.entries()) {
+    expect(row).toMatchObject({
+      syncState: "idle",
+      syncClaimedAt: null,
+      syncAttempts: 0,
+      version: (work.before[i]?.version ?? 0) + 1,
     });
-    expect(t.source.calls).toHaveLength(0);
-    expect(await runSync(t.rt)).toMatchObject({ synced: 1 });
+  }
+  expect(inside.override).toMatchObject({
+    status: "expired",
+    endedAt: at(NOW, -HOUR),
+  });
+  expect(inside.usage).toBeNull();
+}
+
+/** After a rollback every row is as seeded. */
+async function expectUntouched(t: Setup, work: SweepWork) {
+  for (const [i, id] of work.orgs.entries()) {
+    expect(await snapshotOf(t.auth, id)).toEqual(work.before[i]);
+  }
+  expect(await overrideOf(t.auth, work.lapsed.id)).toMatchObject({
+    status: "active",
+    endedAt: null,
+  });
+  expect(await usageOf(t.auth, work.oldUsage.id)).not.toBeNull();
+}
+
+/** After a commit the sweep's writes persist. */
+async function expectSwept(t: Setup, work: SweepWork) {
+  for (const [i, id] of work.orgs.entries()) {
+    expect(await snapshotOf(t.auth, id)).toMatchObject({
+      planKey: ["pro", "team"][i],
+      syncState: "idle",
+      version: (work.before[i]?.version ?? 0) + 1,
+    });
+  }
+  expect(await overrideOf(t.auth, work.lapsed.id)).toMatchObject({
+    status: "expired",
+  });
+  expect(await usageOf(t.auth, work.oldUsage.id)).toBeNull();
+}
+
+const SWEPT = { synced: 2, expired: 1, pruned: 1, hasMore: false };
+
+describe("runSync inside a transaction joins it (PRD A4)", () => {
+  it("runs on the transaction's adapter; its writes are visible inside and gone after a rollback", async () => {
+    const t = await setup();
+    const work = await seedSweepWork(t);
+    await expect(
+      expectNoOuterCalls(t.auth, async () => {
+        expect(await runSync(t.rt)).toMatchObject(SWEPT);
+        await expectSweptInside(t, work);
+        throw new Error("roll back");
+      }),
+    ).rejects.toThrow("roll back");
+    await expectUntouched(t, work);
+    // the rolled-back rows are still due: a later sweep takes them
+    t.source.calls.length = 0;
+    expect(await runSync(t.rt)).toMatchObject(SWEPT);
+    await expectSwept(t, work);
+  });
+
+  it("a committed run persists its writes", async () => {
+    const t = await setup();
+    const work = await seedSweepWork(t);
+    await expectNoOuterCalls(t.auth, async () => {
+      expect(await runSync(t.rt)).toMatchObject(SWEPT);
+      await expectSweptInside(t, work);
+    });
+    await expectSwept(t, work);
+    expect(planEvents(t.onEvent)).toHaveLength(2);
+  });
+
+  it("auth.api.processEntitlementsSync() joins it too", async () => {
+    const t = await setup();
+    const work = await seedSweepWork(t);
+    await expect(
+      expectNoOuterCalls(t.auth, async () => {
+        expect(await t.auth.api.processEntitlementsSync()).toMatchObject(SWEPT);
+        await expectSweptInside(t, work);
+        throw new Error("roll back");
+      }),
+    ).rejects.toThrow("roll back");
+    await expectUntouched(t, work);
+  });
+
+  it("core's sweepAll(auth) joins it through byo.sweep", async () => {
+    const t = await setup();
+    const work = await seedSweepWork(t);
+    await expect(
+      expectNoOuterCalls(t.auth, async () => {
+        const result = await sweepAll(t.auth);
+        expect(result.results).toHaveLength(1);
+        expect(result.results[0]?.error).toBeUndefined();
+        expect(result.results[0]).toMatchObject({
+          pluginId: "entitlements",
+          last: SWEPT,
+        });
+        await expectSweptInside(t, work);
+        throw new Error("roll back");
+      }),
+    ).rejects.toThrow("roll back");
+    await expectUntouched(t, work);
+    await expectNoOuterCalls(t.auth, async () => {
+      expect((await sweepAll(t.auth)).results[0]?.error).toBeUndefined();
+    });
+    await expectSwept(t, work);
   });
 });

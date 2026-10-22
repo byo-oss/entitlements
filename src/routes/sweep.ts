@@ -8,6 +8,7 @@ import type { EntitlementsSweepResult } from "../types";
  * `processEntitlementsSync`: `createAuthEndpoint.serverOnly` (no path, so
  * no HTTP route), returns `runSync(rt)`. Call it from a cron
  * (`auth.api.processEntitlementsSync()`), again while `hasMore` is true.
+ * Called inside the app's `runWithTransaction`, it joins that transaction.
  */
 export function sweepEndpoints(rt: EntitlementsRuntime) {
   return {

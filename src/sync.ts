@@ -7,7 +7,7 @@ import type {
   EntitlementUsageRow,
 } from "./schema";
 import { writeSnapshot } from "./snapshot";
-import { assertOutsideTransaction, currentAdapter } from "./txn";
+import { currentAdapter } from "./txn";
 import type { BillingSource, EntitlementsSweepResult } from "./types";
 
 const PREFIX = "[@byo-oss/entitlements]";
@@ -63,12 +63,18 @@ type Outcome = "synced" | "skipped" | "retrying" | "failed";
  *    most `batchSize` rows.
  * 6. `hasMore` is true when any step found more than `batchSize` rows.
  *
- * Steps 1–4 are skipped without a source. Must run outside a transaction.
+ * Steps 1–4 are skipped without a source.
+ *
+ * Inside the app's `runWithTransaction` the sweep joins that transaction
+ * (PRD A4): every read and write, and `source.resolve`, goes through
+ * `currentAdapter(rt)`, so its writes commit or roll back with the caller.
+ * It only updates and deletes existing rows, so no create conflict can
+ * abort the caller, and it schedules no background work. Events are
+ * emitted when the adapter write returns, before the caller commits.
  */
 export async function runSync(
   rt: EntitlementsRuntime,
 ): Promise<EntitlementsSweepResult> {
-  await assertOutsideTransaction(rt, "processEntitlementsSync");
   const adapter = await currentAdapter(rt);
   const now = rt.now();
   const counts: Counts = {
