@@ -1,0 +1,65 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write # gh release create
+  id-token: write # npm trusted publishing (OIDC)
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+
+      # trusted publishing needs npm >= 11.5.1, newer than what node 24 bundles
+      - run: npm install -g npm@latest
+
+      - run: pnpm install --frozen-lockfile
+
+      # a tag that disagrees with package.json publishes the wrong version under
+      # the right name, and npm versions are immutable — fail before publish
+      - name: Check tag matches package.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag v$tag does not match package.json $pkg" >&2
+            exit 1
+          fi
+
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm test:sql
+      - run: pnpm test:stripe
+      - run: pnpm test:min
+      - run: pnpm build
+      - run: node scripts/check-exports.mjs
+      - run: node scripts/check-imports.mjs
+      - run: pnpm test:dist
+
+      # no token: npmjs.com trusts this repo + workflow over OIDC, and publishing
+      # that way attaches provenance on its own. A new package name has no
+      # trusted publisher until its first (manual) publish, so a version that's
+      # already on npm is skipped and the release below still gets created
+      - name: Publish
+        run: |
+          name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "$name@$version is already on npm, skipping publish"
+          else
+            npm publish --access public
+          fi
+
+      - run: gh release create "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
