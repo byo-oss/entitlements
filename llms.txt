@@ -1,0 +1,128 @@
+# @byo-oss/entitlements
+
+Plan entitlements as a better-auth plugin. A typed catalog of plans, features and limits; per-organization snapshot of the billing state, atomic usage counters and staff overrides, all in the app's own database (any better-auth adapter). Requires better-auth ^1.7.7 and the organization plugin. Organizations only: no user-scoped subscriptions.
+
+## Install & wire
+
+npm install @byo-oss/entitlements
+
+// lib/catalog.ts (browser-safe; also importable from a static pricing page)
+import { defineEntitlements } from "@byo-oss/entitlements/catalog";
+export const catalog = defineEntitlements({
+  features: ["exports", "sso", "prioritySupport"],
+  limits: {
+    apiCalls: { kind: "metered", period: "day" },   // day | month (UTC) | billing (subscription period)
+    members: { kind: "capacity" },                  // the app supplies the count
+    projects: { kind: "capacity" },
+    retentionDays: { kind: "value" },               // a plan setting, read with getLimit
+  },
+  plans: {
+    free: { features: { exports: false, sso: false, prioritySupport: false }, limits: { apiCalls: 1000, members: 5, projects: 3, retentionDays: 7 }, display: { name: "Free" } },
+    pro: { features: { exports: true, sso: false, prioritySupport: false }, limits: { apiCalls: 50000, members: 50, projects: "unlimited", retentionDays: 90 } },
+  },
+  defaultPlan: "free",
+  planAliases: { legacy: "pro" },
+});
+// every plan sets every key and nothing else (type error + boot error). Plan keys /^[a-z][a-z0-9_-]*$/. Limits: non-negative integers or "unlimited". At most 150 feature+limit keys. Never rename a plan key that has subscribers: alias it.
+
+// lib/auth.ts
+import { entitlements } from "@byo-oss/entitlements";
+betterAuth({ plugins: [organization({ ac, roles }), entitlements({ catalog, staffOrganizationId, source })] });
+// organization() MUST come before entitlements(). Then: npx @better-auth/cli migrate (creates entitlementSnapshot, entitlementOverride, entitlementUsage).
+
+// access control: spread the statements, give roles the actions
+import { entitlementsStatements } from "@byo-oss/entitlements";
+const ac = createAccessControl({ ...defaultStatements, ...entitlementsStatements });
+// owner/admin: entitlements: ["read", "override"]; member: ["read"]. "override" is only checked in the staff organization, "read" in the target organization (or the staff one).
+
+// client: lib/auth-client.ts
+import { entitlementsClient } from "@byo-oss/entitlements/client";
+createAuthClient({ plugins: [organizationClient(), entitlementsClient()] });
+// authClient.entitlements.get({ query: { organizationId } }) / .refresh({ organizationId }) / .override.set(body) / .override.remove({ id }) / .overrides({ query })
+
+## Typed server API (server only)
+
+import { createEntitlements } from "@byo-oss/entitlements";
+export const gate = createEntitlements(auth, catalog);   // catalog must be the plugin's catalog (same reference, else deep equal)
+await gate.get(orgId)                                    // → { organizationId, degraded, plan: { key, display, source: "billing"|"default"|"override" }, status, periodEnd, cancelAtPeriodEnd, features, limits, overrides: [{ kind, key, expiresAt }] }
+await gate.getMany(orgIds)                               // ≤1000 ids; [] → []; same order
+await gate.hasFeature(orgId, "exports")                  // → { allowed, reason, key, plan, upgradeTo: PlanKey[] }
+await gate.getLimit(orgId, "apiCalls")                   // → { limit, allowed, reason, degraded, plan, upgradeTo }; metered keys add { used, remaining, resetAt }; consumes nothing
+await gate.consumeUsage(orgId, "apiCalls", { amount: 1 }) // metered keys only → { allowed, reason, used, limit, remaining, resetAt, firstRefusal, plan, upgradeTo }
+await gate.checkCapacity(orgId, "members", { count, adding: 1 }) // capacity keys only → { allowed, reason, count, limit, over, plan, upgradeTo }
+await gate.sync(orgId)                                   // resync from the source now; THROWS on a source/db failure
+await gate.invalidate(orgId)                             // clear this process's cache entry
+// reason: "ok" | "not_in_plan" | "limit_reached" | "error". consumeUsage is one guarded incrementOne: atomic, refusals never count (used unchanged, refused +1), firstRefusal is true once per period (emits limit_reached). amount is a positive integer.
+// getLimit: limit 0 → not_in_plan; metered remaining 0 → limit_reached. checkCapacity: allowed = count + adding <= limit; over = count > limit (a downgraded org). Two concurrent creates can both pass checkCapacity: lock the organization row (SELECT … FOR UPDATE) in the transaction that counts and creates.
+// Failure policy: reads never throw for an outage. A throwing db/source/resolveEntitlements hook → get/getMany/getLimit answer defaultPlan with degraded: true; hasFeature/consumeUsage/checkCapacity answer onError(error, { organizationId, key, operation }) ("deny" by default) with reason "error". One log line per failure. An id that is not an organization answers defaultPlan, not degraded, and writes nothing.
+// A wrong-kind or unknown key from an untyped caller throws "[@byo-oss/entitlements] UNKNOWN_KEY: …" (programmer error, not a refusal). The server API types reject typos at compile time.
+
+import { upgradeTo } from "@byo-oss/entitlements/catalog";
+upgradeTo(catalog, { feature: "sso" }) | upgradeTo(catalog, { limit: "projects", atLeast: 10 })  // plan keys that unlock it, catalog order
+
+## Options (every duration is in ms except pastDueGraceDays)
+
+catalog (required) · source (BillingSource; unset → everyone on defaultPlan + overrides) · isEntitled(snapshot, now) (default: active, trialing, past_due within grace) · pastDueGraceDays 7 (days, counted from pastDueSince) · resolveEntitlements({ organizationId, plan, snapshot, features, limits }) → { features?, limits? } (replaces keys; after a plan override, before feature/limit overrides) · staffOrganizationId · authorize({ session, headers, organizationId, permissions }) · acceptSession({ session, headers, kind: "member"|"staff", method, path }) (default refuses impersonated sessions on staff calls and POSTs; a custom one replaces it) · onEvent(event) · onError(error, { organizationId, key, operation }) default deny · cacheTtlMs 30000 (0 = off; max 10000 orgs) · maxAge 3600000 (≥60000) · usageRetention 7776000000 (≥86400000) · overrideRetention 31536000000 (≥86400000) · organizationCleanup true · maxAttempts 5 · batchSize 100 (1-1000) · leaseMs 300000 · schema (rename tables/columns).
+// a value in the wrong unit (overrideRetention: 365) fails boot. Boot errors are prefixed [@byo-oss/entitlements]. No organization plugin → ORGANIZATION_PLUGIN_REQUIRED. No staffOrganizationId and no authorize → one warning; override endpoints deny.
+
+## Endpoints (all need a session; no credential-free route)
+
+GET /entitlements/get            getEntitlements            gated entitlements:read in organizationId, else in the staff org → result + usage per metered key { used, remaining, resetAt }; staff also see override id, reason, createdBy
+POST /entitlements/refresh       refreshEntitlements        same gate → same body after a cache-bypassing sync (call on return from checkout)
+POST /entitlements/override/set  setEntitlementOverride     gated entitlements:override in the staff org → { override }; body { organizationId, kind: "plan"|"feature"|"limit", key, value, reason (1-500 chars), expiresAt? (future) }
+POST /entitlements/override/remove removeEntitlementOverride gated entitlements:override in the staff org → { ok: true }; body { id }
+GET /entitlements/overrides      listEntitlementOverrides   gated entitlements:read in the staff org; query { organizationId?, status?, cursor? } → { overrides, nextCursor }, newest first, up to 50 per page
+auth.api.processEntitlementsSync({})  server-only, no HTTP route → { synced, skipped, retrying, failed, expired, pruned, hasMore }
+// GET endpoints (for apps that classify GETs, e.g. an impersonation guard): /entitlements/get, /entitlements/overrides. Every other route is POST.
+// Gate order: authorize in the target org (member), else in the staff org (staff); neither → 404 ORGANIZATION_NOT_FOUND (never 403, no id leak); acceptSession false → 403 SESSION_NOT_ACCEPTED; staff paths check the organization exists. 503 ENTITLEMENTS_UNAVAILABLE instead of a degraded plan. Bad override → 400 INVALID_OVERRIDE; unknown override → 404 OVERRIDE_NOT_FOUND; bad list cursor → 400 INVALID_CURSOR.
+// Overrides replace the plan's value (they can restrict). One live plan override per org; a new override for the same (org, kind, key) marks the old one removed. A plan override has no value; its key is a plan key (not an alias).
+
+## Billing sources
+
+import { fromBetterAuthStripe, stripePlans } from "@byo-oss/entitlements/stripe";
+plugins: [organization({ ac, roles }), stripe({ stripeClient, stripeWebhookSecret, organization: { enabled: true }, subscription: { enabled: true, plans: stripePlans(catalog, { pro: { priceId } }) } }), entitlements({ catalog, source: fromBetterAuthStripe() })]
+// needs @better-auth/stripe ^1.7.7 with subscription.enabled and organization.enabled. Boot fails when a Stripe plan name is not a catalog plan or alias. It wraps the Stripe plugin's onEvent once: on checkout.session.completed and customer.subscription.created|updated|deleted it resyncs the organization, then calls your handler. Unknown/user/deleted-org events answer 200; a failed resync → 400 so Stripe redelivers. One stripe() plugin per betterAuth() instance. It only reads the subscription table.
+// BillingSource: { id, resolve(organizationId, { adapter }) → BillingState | null (throw to retry; read via ctx.adapter), connect?(context, changed) }. BillingState: { planKey, status, periodStart?, periodEnd?, cancelAtPeriodEnd?, seats?, sourceRef? }. No permanent-failure type: a failing source never drops a paid plan.
+// Community adapters: package byo-entitlements-<provider>, test with testBillingSource.
+import { memorySource, testBillingSource } from "@byo-oss/entitlements/testing";   // vitest, ESM only
+const source = memorySource(); await source.set(orgId, { planKey: "pro", status: "active" }); source.setFailure(new Error("down"));
+testBillingSource({ setup: async () => ({ source, auth, organizationId, setState }), failing: async () => ({ source: throwing, auth, organizationId }) });
+
+## Freshness
+
+// push (source events) · read-through (first read writes a snapshot, also with no subscription) · background refresh past maxAge (context.runInBackground when advanced.backgroundTasks.handler is set, else marked due for the sweep) · sweep · refreshEntitlements after checkout.
+await auth.api.processEntitlementsSync({}) // from a cron (every minute); repeat while hasMore. Claims due snapshots with a lease, resolves, backs off 1 min doubling (cap maxAge), marks overrides past expiresAt "expired", prunes usage (usageRetention) and ended overrides (overrideRetention). After maxAttempts a snapshot counts failed, keeps its last good state and retries at maxAge. Without a source only expiry and pruning run. @byo-oss/core's sweepAll(auth) runs it with the other BYO plugins.
+// Staleness across processes: each process caches up to cacheTtlMs (30s); it clears its own entry on its own writes and on invalidate(). Another process's write can show up cacheTtlMs late. refreshEntitlements is always fresh. Usage counters are never cached.
+// incrementOne atomicity: Kysely/Drizzle re-apply the guard on the UPDATE from better-auth 1.7.7 (exact); memory, Prisma, MongoDB native (exact); a custom adapter without incrementOne uses core's fallback (prior-value guard, 5 tries, then throws → onError denies under contention).
+
+## Inside a transaction (adapters with real transactions)
+
+// Everything reads/writes through getCurrentAdapter, so a call in your runWithTransaction joins it. get/getMany/hasFeature/getLimit/checkCapacity work: they never write the cache, never persist a snapshot, never schedule a refresh. consumeUsage, sync and refreshEntitlements THROW "[@byo-oss/entitlements] <name> must run outside a transaction": call them before/after. Override writes join the transaction; their events fire before commit and can announce a rolled-back write.
+
+## Events (onEvent; best-effort, at most once, in-process; no free text)
+
+entitlements.plan.changed { from, to, status } · entitlements.override.set { kind, key, value, expiresAt } · entitlements.override.removed { kind, key } · entitlements.usage.limit_reached { key, limit, periodEnd } (first refusal per period)
+onEvent: async (event): Promise<void> => { if (event.type === "entitlements.usage.limit_reached" && event.organizationId) await auth.api.notify({ body: { organizationId: event.organizationId, roles: ["owner", "admin"], type: "entitlements.limit_reached", title: "...", href: "/billing" } }); }
+
+## React (@byo-oss/entitlements/react; pass the client as a prop)
+
+const entitlements = useEntitlements<typeof catalog>({ client: authClient, organizationId });  // { data, isLoading, error, hasFeature(key), limit(key), usage(key), refresh() }
+<EntitlementGate entitlements={entitlements} feature="exports" catalog={catalog} fallback={({ upgradeTo, isLoading }) => <a href="/billing">Upgrade to {upgradeTo[0]}</a>}>…</EntitlementGate>
+<UsageMeter entitlements={entitlements} limitKey="apiCalls" catalog={catalog} className barClassName labels={{ usage, loading, error }} />  // role="progressbar", aria-valuenow/min/max/valuetext ("920 of 1,000 API calls used today"), shadcn tokens
+// Tailwind v4: add @source "<path>/node_modules/@byo-oss/entitlements/dist"; to the CSS.
+
+## Lifecycle, export, uninstall
+
+// organizationCleanup (default true) deletes an org's rows after /organization/delete. For other deletes: await deleteOrganizationData(auth, organizationId) → Promise<void>. organizationCleanup: false → SQL cascades via FKs, memory/MongoDB keep rows until you call it. User delete nulls createdBy/removedBy on overrides.
+import { exportEntitlementsData } from "@byo-oss/entitlements";
+let cursor: string | null = null; do { const page = await exportEntitlementsData(auth, { organizationId?, cursor, limit: 100 }); /* page.snapshots, page.overrides (+ createdByEmail, removedByEmail), page.usage; one model per page */ cursor = page.nextCursor; } while (cursor);
+// limit 1-1000. Offset paging over id: a row deleted mid-export can shift later rows. The catalog is not exported.
+// Uninstall: remove the plugin, then drop entitlementUsage, entitlementOverride, entitlementSnapshot (in that order; none references another).
+
+## Notes
+
+- schema: entitlementSnapshot (organizationId unique; planKey, status, periodStart/End, cancelAtPeriodEnd, seats, pastDueSince, sourceRef, version, syncedAt, nextSyncAt, syncState, syncClaimedAt, syncAttempts, syncError), entitlementOverride (organizationId, status, kind, key, value JSON, reason, permanent, expiresAt, endedAt, createdBy, removedBy, createdAt), entitlementUsage (bucket unique, organizationId, key, periodStart, periodEnd, used, refused). Full tables in the README.
+- MongoDB: create unique indexes on entitlementSnapshot.organizationId and entitlementUsage.bucket, or concurrent first writes can duplicate rows and over-allow.
+- Error codes: ENTITLEMENTS_ERROR_CODES (ORGANIZATION_PLUGIN_REQUIRED, NOT_ALLOWED, SESSION_NOT_ACCEPTED, UNKNOWN_KEY, INVALID_OVERRIDE, OVERRIDE_NOT_FOUND, ORGANIZATION_NOT_FOUND, ENTITLEMENTS_UNAVAILABLE, INVALID_CURSOR).
+- Do not query or write the plugin's tables from app code; go through createEntitlements, auth.api.*, the client and the exported functions.
+- community plugin, not affiliated with better-auth
