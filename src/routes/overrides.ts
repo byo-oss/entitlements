@@ -1,13 +1,25 @@
-// BYO_STUB: N06 replaces this file (contracts.md "routes/overrides.ts")
+import type { GenericEndpointContext, Where } from "better-auth";
 import {
   APIError,
   createAuthEndpoint,
   sessionMiddleware,
 } from "better-auth/api";
 import * as z from "zod";
+import {
+  type EntitlementsRoute,
+  requireOrgExists,
+  requireStaff,
+} from "../access";
 import { ENTITLEMENTS_ERROR_CODES } from "../error-codes";
+import {
+  removeOverride,
+  setOverride,
+  toPublicOverride,
+  validateOverride,
+} from "../overrides";
 import type { EntitlementsRuntime } from "../runtime";
-import { OVERRIDE_STATUSES } from "../schema";
+import { type EntitlementOverrideRow, OVERRIDE_STATUSES } from "../schema";
+import { currentAdapter } from "../txn";
 import type {
   ListOverridesResponse,
   RemoveOverrideResponse,
@@ -16,6 +28,147 @@ import type {
 
 /** Overrides per `listEntitlementOverrides` page. */
 export const OVERRIDES_PAGE_SIZE = 50;
+
+/**
+ * Most ids a list cursor carries: the rows already returned with the
+ * cursor's `createdAt`. So at most `MAX_CURSOR_IDS + OVERRIDES_PAGE_SIZE`
+ * (250) overrides sharing one `createdAt` can be paged; past that the next
+ * page answers 400 `INVALID_CURSOR`.
+ */
+export const MAX_CURSOR_IDS = 200;
+
+const SET_ROUTE: EntitlementsRoute = {
+  method: "POST",
+  path: "/entitlements/override/set",
+};
+const REMOVE_ROUTE: EntitlementsRoute = {
+  method: "POST",
+  path: "/entitlements/override/remove",
+};
+const LIST_ROUTE: EntitlementsRoute = {
+  method: "GET",
+  path: "/entitlements/overrides",
+};
+
+const invalidCursor = () =>
+  APIError.from("BAD_REQUEST", ENTITLEMENTS_ERROR_CODES.INVALID_CURSOR);
+
+/** The decoded list cursor: the last row's `createdAt` and the ids returned with it. */
+type ListCursor = { at: string; ids: string[] };
+
+const time = (value: Date | string | number) => new Date(value).getTime();
+
+function toBase64Url(text: string): string {
+  let binary = "";
+  for (const byte of new TextEncoder().encode(text)) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+function fromBase64Url(value: string): string {
+  if (!/^[A-Za-z0-9_-]*$/.test(value)) throw new Error("not base64url");
+  const base64 = value.replace(/-/g, "+").replace(/_/g, "/");
+  const binary = atob(base64 + "=".repeat((4 - (base64.length % 4)) % 4));
+  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+}
+
+/** Opaque base64url JSON of `{ at, ids }`. */
+export function encodeListCursor(cursor: ListCursor): string {
+  return toBase64Url(JSON.stringify(cursor));
+}
+
+/**
+ * Decodes a list cursor. A malformed one (not base64url JSON, `at` not a
+ * date, `ids` not a non-empty list of strings) or one carrying more than
+ * `MAX_CURSOR_IDS` ids → 400 `INVALID_CURSOR`.
+ */
+export function decodeListCursor(value: string): ListCursor {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fromBase64Url(value));
+  } catch {
+    throw invalidCursor();
+  }
+  if (typeof parsed !== "object" || parsed === null) throw invalidCursor();
+  const { at, ids } = parsed as { at?: unknown; ids?: unknown };
+  if (typeof at !== "string" || Number.isNaN(time(at))) throw invalidCursor();
+  if (
+    !Array.isArray(ids) ||
+    ids.length === 0 ||
+    ids.length > MAX_CURSOR_IDS ||
+    !ids.every((id) => typeof id === "string")
+  ) {
+    throw invalidCursor();
+  }
+  return { at, ids: ids as string[] };
+}
+
+// newest first, ties by id
+const newestFirst = (a: EntitlementOverrideRow, b: EntitlementOverrideRow) =>
+  time(b.createdAt) - time(a.createdAt) ||
+  (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+
+/**
+ * One page of overrides, newest first, with the keyset cursor (contracts
+ * D9): `createdAt lte at` (plus the filters, all AND) sorted `createdAt`
+ * desc, `limit = page + 1 + ids.length`; the cursor's ids are dropped and
+ * ties ordered by id in code.
+ */
+async function listPage(
+  rt: EntitlementsRuntime,
+  input: {
+    organizationId?: string;
+    status?: (typeof OVERRIDE_STATUSES)[number];
+    cursor?: string;
+  },
+): Promise<ListOverridesResponse> {
+  const cursor =
+    input.cursor !== undefined ? decodeListCursor(input.cursor) : null;
+  const where: Where[] = [];
+  if (input.organizationId !== undefined) {
+    where.push({ field: "organizationId", value: input.organizationId });
+  }
+  if (input.status !== undefined) {
+    where.push({ field: "status", value: input.status });
+  }
+  if (cursor) {
+    where.push({
+      field: "createdAt",
+      operator: "lte",
+      value: new Date(cursor.at),
+    });
+  }
+  const seen = new Set(cursor?.ids ?? []);
+  const adapter = await currentAdapter(rt);
+  const rows = await adapter.findMany<EntitlementOverrideRow>({
+    model: "entitlementOverride",
+    where,
+    sortBy: { field: "createdAt", direction: "desc" },
+    limit: OVERRIDES_PAGE_SIZE + 1 + seen.size,
+  });
+  const candidates = rows.filter((row) => !seen.has(row.id)).sort(newestFirst);
+  const page = candidates.slice(0, OVERRIDES_PAGE_SIZE);
+  const last = page.at(-1);
+  let nextCursor: string | null = null;
+  if (last && candidates.length > OVERRIDES_PAGE_SIZE) {
+    const at = time(last.createdAt);
+    const ids = page
+      .filter((row) => time(row.createdAt) === at)
+      .map((row) => row.id);
+    // still on the cursor's timestamp: keep the ids already returned with it
+    const carried = cursor && time(cursor.at) === at ? cursor.ids : [];
+    nextCursor = encodeListCursor({
+      at: new Date(at).toISOString(),
+      ids: [...carried, ...ids],
+    });
+  }
+  return { overrides: page.map(toPublicOverride), nextCursor };
+}
 
 /**
  * The staff endpoints, each `sessionMiddleware` then `requireStaff`:
@@ -29,21 +182,20 @@ export const OVERRIDES_PAGE_SIZE = 50;
  * - `removeEntitlementOverride` (POST `/entitlements/override/remove`,
  *   `entitlements:override`): `removeOverride` → `{ ok: true }`.
  * - `listEntitlementOverrides` (GET `/entitlements/overrides`,
- *   `entitlements:read`): newest first, 50 per page, keyset cursor
- *   (PRD Query rules); a malformed cursor or a page past the tie bound →
- *   400 `INVALID_CURSOR`.
- * Stub: every endpoint answers 404 `ORGANIZATION_NOT_FOUND`.
+ *   `entitlements:read`): newest first, 50 per page, keyset cursor; a
+ *   malformed cursor or a page past the tie bound (250 overrides sharing
+ *   one `createdAt`) → 400 `INVALID_CURSOR`.
+ * Writes go through `currentAdapter`, so inside a caller's transaction they
+ * join it.
  */
-export function overrideEndpoints(_rt: EntitlementsRuntime) {
-  const notFound = () =>
-    APIError.from("NOT_FOUND", ENTITLEMENTS_ERROR_CODES.ORGANIZATION_NOT_FOUND);
+export function overrideEndpoints(rt: EntitlementsRuntime) {
   return {
     setEntitlementOverride: createAuthEndpoint(
       "/entitlements/override/set",
       {
         method: "POST",
         // loose on purpose: a wrong kind, key or value reaches
-        // validateOverride and answers 400 INVALID_OVERRIDE (PRD), not
+        // validateOverride and answers 400 INVALID_OVERRIDE, not
         // better-auth's own 400
         body: z.object({
           organizationId: z.string().min(1),
@@ -55,8 +207,22 @@ export function overrideEndpoints(_rt: EntitlementsRuntime) {
         }),
         use: [sessionMiddleware],
       },
-      async (): Promise<SetOverrideResponse> => {
-        throw notFound();
+      async (ctx): Promise<SetOverrideResponse> => {
+        const { session } = await requireStaff(
+          ctx as unknown as GenericEndpointContext,
+          rt,
+          "override",
+          SET_ROUTE,
+        );
+        const body = ctx.body;
+        await requireOrgExists(
+          rt,
+          await currentAdapter(rt),
+          body.organizationId,
+        );
+        const valid = validateOverride(rt, body, rt.now());
+        const row = await setOverride(rt, valid, { userId: session.user.id });
+        return { override: toPublicOverride(row) };
       },
     ),
     removeEntitlementOverride: createAuthEndpoint(
@@ -66,8 +232,15 @@ export function overrideEndpoints(_rt: EntitlementsRuntime) {
         body: z.object({ id: z.string().min(1) }),
         use: [sessionMiddleware],
       },
-      async (): Promise<RemoveOverrideResponse> => {
-        throw notFound();
+      async (ctx): Promise<RemoveOverrideResponse> => {
+        const { session } = await requireStaff(
+          ctx as unknown as GenericEndpointContext,
+          rt,
+          "override",
+          REMOVE_ROUTE,
+        );
+        await removeOverride(rt, ctx.body.id, { userId: session.user.id });
+        return { ok: true };
       },
     ),
     listEntitlementOverrides: createAuthEndpoint(
@@ -81,8 +254,14 @@ export function overrideEndpoints(_rt: EntitlementsRuntime) {
         }),
         use: [sessionMiddleware],
       },
-      async (): Promise<ListOverridesResponse> => {
-        throw notFound();
+      async (ctx): Promise<ListOverridesResponse> => {
+        await requireStaff(
+          ctx as unknown as GenericEndpointContext,
+          rt,
+          "read",
+          LIST_ROUTE,
+        );
+        return listPage(rt, ctx.query);
       },
     ),
   };
