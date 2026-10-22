@@ -3,7 +3,16 @@ import { createEntitlements } from "./api";
 import { checkCapacity } from "./capacity";
 import type { LimitValue } from "./catalog";
 import type { EntitlementsOnError } from "./options";
-import { getRuntime, makeAuth, seedOrg, testCatalog } from "./test-utils";
+import {
+  type AdapterCall,
+  fakeSource,
+  getContext,
+  getRuntime,
+  makeAuth,
+  seedOrg,
+  setSnapshot,
+  testCatalog,
+} from "./test-utils";
 
 async function setup(
   config: {
@@ -104,6 +113,64 @@ describe("checkCapacity (PRD #14)", () => {
         adding: 0,
       }),
     ).toMatchObject({ allowed: false, over: true });
+  });
+
+  it("over: a real plan change from pro to no subscription (free)", async () => {
+    const calls: AdapterCall[] = [];
+    const auth = makeAuth({
+      // the snapshot changes between calls: no cached resolution
+      options: { source: fakeSource(), cacheTtlMs: 0 },
+      adapter: { before: (call) => void calls.push(call) },
+    });
+    const api = createEntitlements(auth, testCatalog);
+    const { organizationId } = await seedOrg(auth);
+    await setSnapshot(auth, organizationId, {
+      planKey: "pro",
+      status: "active",
+    });
+    // pro: members 50
+    expect(
+      await api.checkCapacity(organizationId, "members", { count: 12 }),
+    ).toMatchObject({
+      allowed: true,
+      reason: "ok",
+      plan: "pro",
+      count: 12,
+      limit: 50,
+      over: false,
+    });
+    // the subscription ends: no plan, no status, so the default plan (free: 5)
+    await setSnapshot(auth, organizationId, { planKey: null, status: null });
+    calls.length = 0;
+    const downgraded = await api.checkCapacity(organizationId, "members", {
+      count: 12,
+    });
+    expect(downgraded).toMatchObject({
+      allowed: false,
+      reason: "limit_reached",
+      plan: "free",
+      count: 12,
+      limit: 5,
+      over: true,
+    });
+    expect(downgraded.upgradeTo).toEqual(["pro", "team"]);
+    expect(
+      await api.checkCapacity(organizationId, "members", {
+        count: 12,
+        adding: 0,
+      }),
+    ).toMatchObject({ allowed: false, over: true });
+    // nothing is deleted: no delete calls, and the snapshot row is still there
+    expect(calls.filter((call) => call.method.startsWith("delete"))).toEqual(
+      [],
+    );
+    const { adapter } = await getContext(auth);
+    expect(
+      await adapter.count({
+        model: "entitlementSnapshot",
+        where: [{ field: "organizationId", value: organizationId }],
+      }),
+    ).toBe(1);
   });
 
   it("unlimited always allows and is never over", async () => {
