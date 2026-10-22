@@ -1,8 +1,12 @@
-// BYO_STUB: N03 replaces this file (contracts.md "snapshot.ts")
 import type { DBTransactionAdapter } from "better-auth";
-import type { EntitlementsRuntime } from "./runtime";
+import { canonicalPlanKey, type PlanKey } from "./catalog";
+import { emit, entitlementsEvent } from "./events";
+import { type EntitlementsRuntime, singleFlight, warnOnce } from "./runtime";
 import type { EntitlementSnapshotRow } from "./schema";
 import type { BillingState } from "./types";
+
+const MODEL = "entitlementSnapshot";
+const DAY_MS = 86_400_000;
 
 /** The snapshot columns a state write sets, every one explicitly. */
 export type SnapshotStateFields = Pick<
@@ -18,17 +22,25 @@ export type SnapshotStateFields = Pick<
   | "sourceRef"
 >;
 
+const toDate = (value: Date | string | number | null | undefined) =>
+  value === null || value === undefined ? null : new Date(value);
+
 /**
  * The default `isEntitled`: `active` and `trialing`, and `past_due` while
- * `pastDueSince` is set and `now < pastDueSince + graceDays`.
- * Stub: always false.
+ * `pastDueSince` is set and `now < pastDueSince + graceDays`. Every other
+ * status (and none) is false.
  */
 export function isDefaultEntitled(
-  _snapshot: EntitlementSnapshotRow,
-  _now: Date,
-  _graceDays: number,
+  snapshot: EntitlementSnapshotRow,
+  now: Date,
+  graceDays: number,
 ): boolean {
-  return false;
+  const { status } = snapshot;
+  if (status === "active" || status === "trialing") return true;
+  if (status !== "past_due") return false;
+  const since = toDate(snapshot.pastDueSince);
+  if (!since || Number.isNaN(since.getTime())) return false;
+  return now.getTime() < since.getTime() + graceDays * DAY_MS;
 }
 
 /**
@@ -38,71 +50,220 @@ export function isDefaultEntitled(
  * `cancelAtPeriodEnd: false`; a missing optional field → null; `planKey`
  * lowercased. `pastDueSince` is kept from `previous` while the status stays
  * `past_due`, set to `now` when it becomes `past_due`, null otherwise.
- * Stub: the `null` state.
  */
 export function toSnapshotFields(
-  _state: BillingState | null,
+  state: BillingState | null,
   opts: { source: string; previous: EntitlementSnapshotRow | null; now: Date },
 ): SnapshotStateFields {
+  const status = state?.status ?? null;
+  const { previous, now } = opts;
+  let pastDueSince: Date | null = null;
+  if (status === "past_due") {
+    const kept =
+      previous?.status === "past_due" ? toDate(previous.pastDueSince) : null;
+    pastDueSince = kept ?? now;
+  }
   return {
     source: opts.source,
-    planKey: null,
-    status: null,
-    periodStart: null,
-    periodEnd: null,
-    cancelAtPeriodEnd: false,
-    seats: null,
-    pastDueSince: null,
-    sourceRef: null,
+    planKey:
+      typeof state?.planKey === "string" ? state.planKey.toLowerCase() : null,
+    status,
+    periodStart: toDate(state?.periodStart),
+    periodEnd: toDate(state?.periodEnd),
+    cancelAtPeriodEnd: state?.cancelAtPeriodEnd === true,
+    seats: state?.seats ?? null,
+    pastDueSince,
+    sourceRef: state?.sourceRef ?? null,
   };
 }
 
-/** The organization's snapshot row, or null. Stub: null. */
+/** The organization's snapshot row, or null. */
 export async function readSnapshot(
   _rt: EntitlementsRuntime,
-  _adapter: DBTransactionAdapter,
-  _organizationId: string,
+  adapter: DBTransactionAdapter,
+  organizationId: string,
 ): Promise<EntitlementSnapshotRow | null> {
-  return null;
+  return adapter.findOne<EntitlementSnapshotRow>({
+    model: MODEL,
+    where: [{ field: "organizationId", value: organizationId }],
+  });
+}
+
+/**
+ * The plan a snapshot alone resolves to (no overrides, no hook): its
+ * `planKey` through `planAliases` when `isEntitled` holds and the key is in
+ * the catalog, else `defaultPlan`. An unknown key warns once per process.
+ * Throws what a custom `isEntitled` throws.
+ */
+export function snapshotPlan(
+  rt: EntitlementsRuntime,
+  snapshot: EntitlementSnapshotRow | null,
+  now: Date,
+): { plan: PlanKey<typeof rt.catalog>; entitled: boolean; billed: boolean } {
+  const fallback = rt.catalog.defaultPlan as string;
+  const entitled = snapshot !== null && rt.options.isEntitled(snapshot, now);
+  if (!entitled || !snapshot.planKey) {
+    return { plan: fallback, entitled, billed: false };
+  }
+  const plan = canonicalPlanKey(rt.catalog, snapshot.planKey);
+  if (plan === null) {
+    warnOnce(
+      rt,
+      `plan:${snapshot.planKey}`,
+      `the billing source reported plan "${snapshot.planKey}", which isn't a plan or alias of the catalog; answering defaultPlan "${fallback}"`,
+    );
+    return { plan: fallback, entitled, billed: false };
+  }
+  return { plan, entitled, billed: true };
+}
+
+/** The sync bookkeeping a successful state write sets. */
+function syncFields(rt: EntitlementsRuntime, now: Date) {
+  return {
+    syncedAt: now,
+    nextSyncAt: new Date(now.getTime() + rt.options.maxAge),
+    syncState: "idle" as const,
+    syncAttempts: 0,
+    syncError: null,
+    syncClaimedAt: null,
+    updatedAt: now,
+  };
+}
+
+/** The version-guarded in-place write of `writeSnapshot`. */
+async function updateSnapshot(
+  rt: EntitlementsRuntime,
+  organizationId: string,
+  state: BillingState | null,
+  previous: EntitlementSnapshotRow,
+  adapter: DBTransactionAdapter,
+): Promise<EntitlementSnapshotRow | null> {
+  const now = rt.now();
+  const row = await adapter.incrementOne<EntitlementSnapshotRow>({
+    model: MODEL,
+    where: [
+      { field: "id", value: previous.id },
+      { field: "version", value: previous.version },
+    ],
+    increment: { version: 1 },
+    set: {
+      ...toSnapshotFields(state, {
+        source: rt.options.sourceId,
+        previous,
+        now,
+      }),
+      ...syncFields(rt, now),
+    },
+  });
+  rt.cache.delete(organizationId);
+  if (!row) return null;
+  await notifyPlanChange(rt, organizationId, previous, row);
+  return row;
 }
 
 /**
  * Writes a resolved state for an organization (read-through, push, `sync`).
  * - Creates the row when `previous` is null, through `singleFlight` keyed by
- *   organization; on a create error re-reads and rethrows only if the row
- *   is still missing.
+ *   organization (`snapshot:<id>`). The flight re-reads first and updates a
+ *   row that appeared meanwhile; on a create error it re-reads and rethrows
+ *   only if the row is still missing (else it updates that row).
  * - Otherwise updates in place, guarded on `previous.version`, incrementing
  *   `version`; also when `previous.source` differs from the configured one.
  * - Sets `syncedAt = now`, `nextSyncAt = now + maxAge`, `syncState: "idle"`,
- *   `syncAttempts: 0`, `syncError: null`.
+ *   `syncAttempts: 0`, `syncError: null`, `syncClaimedAt: null`.
  * - Clears this process's cache entry, and emits `entitlements.plan.changed`
  *   (through `notifyPlanChange`) when the resolved plan key changed.
  * Returns the row as stored, or null when nothing was written (the version
  * guard lost to a newer write). Callers outside a transaction only.
- * Stub: writes nothing, returns null.
  */
 export async function writeSnapshot(
-  _rt: EntitlementsRuntime,
-  _organizationId: string,
-  _state: BillingState | null,
-  _opts: {
+  rt: EntitlementsRuntime,
+  organizationId: string,
+  state: BillingState | null,
+  opts: {
     previous: EntitlementSnapshotRow | null;
     adapter: DBTransactionAdapter;
   },
 ): Promise<EntitlementSnapshotRow | null> {
-  return null;
+  const { previous, adapter } = opts;
+  if (previous) {
+    return updateSnapshot(rt, organizationId, state, previous, adapter);
+  }
+  return singleFlight(rt, `snapshot:${organizationId}`, async () => {
+    const existing = await readSnapshot(rt, adapter, organizationId);
+    if (existing) {
+      return updateSnapshot(rt, organizationId, state, existing, adapter);
+    }
+    const now = rt.now();
+    let row: EntitlementSnapshotRow;
+    try {
+      row = await adapter.create<
+        Omit<EntitlementSnapshotRow, "id">,
+        EntitlementSnapshotRow
+      >({
+        model: MODEL,
+        data: {
+          organizationId,
+          ...toSnapshotFields(state, {
+            source: rt.options.sourceId,
+            previous: null,
+            now,
+          }),
+          version: 0,
+          ...syncFields(rt, now),
+          createdAt: now,
+        },
+      });
+    } catch (error) {
+      const raced = await readSnapshot(rt, adapter, organizationId);
+      if (!raced) throw error;
+      return updateSnapshot(rt, organizationId, state, raced, adapter);
+    }
+    rt.cache.delete(organizationId);
+    await notifyPlanChange(rt, organizationId, null, row);
+    return row;
+  });
 }
 
 /**
  * Emits `entitlements.plan.changed` when the plan a snapshot resolves to
  * (`isEntitled` + aliases + `defaultPlan`; overrides not included) differs
- * between `before` and `after`. A missing `before` resolves to
- * `defaultPlan`. Shared by `writeSnapshot` and the sweep (N07).
- * Stub: emits nothing.
+ * between `before` and `after`. A missing `before`, or one written by
+ * another source (which resolution treats as missing), resolves to
+ * `defaultPlan`. Shared by `writeSnapshot` and the sweep (N07). Never
+ * throws: a throwing `isEntitled` is logged and nothing is emitted.
  */
 export async function notifyPlanChange(
-  _rt: EntitlementsRuntime,
-  _organizationId: string,
-  _before: EntitlementSnapshotRow | null,
-  _after: EntitlementSnapshotRow,
-): Promise<void> {}
+  rt: EntitlementsRuntime,
+  organizationId: string,
+  before: EntitlementSnapshotRow | null,
+  after: EntitlementSnapshotRow,
+): Promise<void> {
+  const now = rt.now();
+  let from: string;
+  let to: string;
+  try {
+    from = snapshotPlan(
+      rt,
+      before && before.source === after.source ? before : null,
+      now,
+    ).plan;
+    to = snapshotPlan(rt, after, now).plan;
+  } catch (error) {
+    rt.logger.error(
+      `[@byo-oss/entitlements] isEntitled threw while checking organization ${organizationId} for a plan change; no plan.changed event`,
+      error,
+    );
+    return;
+  }
+  if (from === to) return;
+  await emit(
+    rt,
+    entitlementsEvent("entitlements.plan.changed", {
+      organizationId,
+      actorId: null,
+      data: { from, to, status: after.status ?? null },
+      occurredAt: now,
+    }),
+  );
+}
