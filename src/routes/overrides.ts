@@ -31,8 +31,9 @@ export const OVERRIDES_PAGE_SIZE = 50;
 
 /**
  * Most ids a list cursor carries: the rows already returned with the
- * cursor's `createdAt`. So at most `MAX_CURSOR_IDS + OVERRIDES_PAGE_SIZE`
- * (250) overrides sharing one `createdAt` can be paged; past that the next
+ * cursor's `createdAt`. A tied group always starts on a page of its own, so
+ * up to `MAX_CURSOR_IDS + OVERRIDES_PAGE_SIZE` (250) overrides sharing one
+ * `createdAt` can be paged whatever comes before them; past that the next
  * page answers 400 `INVALID_CURSOR`.
  */
 export const MAX_CURSOR_IDS = 200;
@@ -53,7 +54,10 @@ const LIST_ROUTE: EntitlementsRoute = {
 const invalidCursor = () =>
   APIError.from("BAD_REQUEST", ENTITLEMENTS_ERROR_CODES.INVALID_CURSOR);
 
-/** The decoded list cursor: the last row's `createdAt` and the ids returned with it. */
+/**
+ * The decoded list cursor: a `createdAt` and the ids already returned with
+ * it (empty when no row at `at` has been returned yet).
+ */
 type ListCursor = { at: string; ids: string[] };
 
 const time = (value: Date | string | number) => new Date(value).getTime();
@@ -84,8 +88,8 @@ export function encodeListCursor(cursor: ListCursor): string {
 
 /**
  * Decodes a list cursor. A malformed one (not base64url JSON, `at` not a
- * date, `ids` not a non-empty list of strings) or one carrying more than
- * `MAX_CURSOR_IDS` ids → 400 `INVALID_CURSOR`.
+ * date, `ids` not a list of strings) or one carrying more than
+ * `MAX_CURSOR_IDS` ids → 400 `INVALID_CURSOR`. `ids` may be empty.
  */
 export function decodeListCursor(value: string): ListCursor {
   let parsed: unknown;
@@ -99,7 +103,6 @@ export function decodeListCursor(value: string): ListCursor {
   if (typeof at !== "string" || Number.isNaN(time(at))) throw invalidCursor();
   if (
     !Array.isArray(ids) ||
-    ids.length === 0 ||
     ids.length > MAX_CURSOR_IDS ||
     !ids.every((id) => typeof id === "string")
   ) {
@@ -115,9 +118,20 @@ const newestFirst = (a: EntitlementOverrideRow, b: EntitlementOverrideRow) =>
 
 /**
  * One page of overrides, newest first, with the keyset cursor (contracts
- * D9): `createdAt lte at` (plus the filters, all AND) sorted `createdAt`
- * desc, `limit = page + 1 + ids.length`; the cursor's ids are dropped and
- * ties ordered by id in code.
+ * D9 and its amendment): `createdAt lte at` (plus the filters, all AND)
+ * sorted `createdAt` desc, `limit = page + 1 + ids.length`; the cursor's
+ * ids are dropped and ties ordered by id in code.
+ *
+ * The next cursor:
+ * - the next row is strictly older than the page's last row →
+ *   `{ at: next.createdAt, ids: [] }`, so no ids carry into an older
+ *   timestamp;
+ * - the page ends inside a tied group → `{ at, ids }` with every id already
+ *   returned at that `createdAt` (the cursor's ids too, while consecutive
+ *   pages stay inside it). A tied group that would start partway through
+ *   a page and run past its end starts the next page instead (this page
+ *   stops short of 50), so its ids count from a page boundary and up to
+ *   250 tied rows page out whatever precedes them.
  */
 async function listPage(
   rt: EntitlementsRuntime,
@@ -152,20 +166,39 @@ async function listPage(
     limit: OVERRIDES_PAGE_SIZE + 1 + seen.size,
   });
   const candidates = rows.filter((row) => !seen.has(row.id)).sort(newestFirst);
-  const page = candidates.slice(0, OVERRIDES_PAGE_SIZE);
-  const last = page.at(-1);
-  let nextCursor: string | null = null;
-  if (last && candidates.length > OVERRIDES_PAGE_SIZE) {
+  let page = candidates.slice(0, OVERRIDES_PAGE_SIZE);
+  let next = candidates[OVERRIDES_PAGE_SIZE];
+  let last = page.at(-1);
+  if (last && next && time(next.createdAt) === time(last.createdAt)) {
     const at = time(last.createdAt);
-    const ids = page
-      .filter((row) => time(row.createdAt) === at)
-      .map((row) => row.id);
-    // still on the cursor's timestamp: keep the ids already returned with it
-    const carried = cursor && time(cursor.at) === at ? cursor.ids : [];
-    nextCursor = encodeListCursor({
-      at: new Date(at).toISOString(),
-      ids: [...carried, ...ids],
-    });
+    // still inside the cursor's timestamp: the group began on an earlier page
+    const continuing = cursor !== null && time(cursor.at) === at;
+    const start = page.findIndex((row) => time(row.createdAt) === at);
+    if (!continuing && start > 0) {
+      // the group starts partway through: stop before it
+      page = page.slice(0, start);
+      next = candidates[start];
+      last = page.at(-1);
+    }
+  }
+  let nextCursor: string | null = null;
+  if (last && next) {
+    const at = time(last.createdAt);
+    if (time(next.createdAt) < at) {
+      nextCursor = encodeListCursor({
+        at: new Date(time(next.createdAt)).toISOString(),
+        ids: [],
+      });
+    } else {
+      const carried = cursor && time(cursor.at) === at ? cursor.ids : [];
+      const ids = page
+        .filter((row) => time(row.createdAt) === at)
+        .map((row) => row.id);
+      nextCursor = encodeListCursor({
+        at: new Date(at).toISOString(),
+        ids: [...carried, ...ids],
+      });
+    }
   }
   return { overrides: page.map(toPublicOverride), nextCursor };
 }
