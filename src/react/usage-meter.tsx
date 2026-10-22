@@ -1,7 +1,6 @@
-// BYO_STUB: N11 replaces this file (contracts.md "react/usage-meter.tsx")
 import type { ReactNode } from "react";
-import type { AnyCatalog, MeteredKey } from "../catalog";
-import type { UsageMeterLabels } from "./labels";
+import type { AnyCatalog, MeteredKey, MeteredPeriod } from "../catalog";
+import { defaultLabels, type UsageMeterLabels } from "./labels";
 import type { UseEntitlementsResult } from "./use-entitlements";
 
 export type UsageMeterProps<C extends AnyCatalog = AnyCatalog> = {
@@ -20,14 +19,94 @@ export type UsageMeterProps<C extends AnyCatalog = AnyCatalog> = {
   labels?: Partial<UsageMeterLabels>;
 };
 
+const join = (...classes: (string | undefined)[]) =>
+  classes.filter(Boolean).join(" ");
+
+function periodOf(catalog: AnyCatalog | undefined, key: string) {
+  const definition = (
+    catalog?.limits as
+      | Record<string, { kind: string; period?: MeteredPeriod }>
+      | undefined
+  )?.[key];
+  return definition?.kind === "metered" && definition.period
+    ? definition.period
+    : null;
+}
+
 /**
  * A progress bar on shadcn tokens (`bg-muted`, `bg-primary`,
  * `text-muted-foreground`) with `role="progressbar"`, `aria-valuenow`,
- * `aria-valuemin`, `aria-valuemax` and `aria-valuetext`. Stub: renders
- * nothing.
+ * `aria-valuemin`, `aria-valuemax` and `aria-valuetext`.
+ *
+ * For an `"unlimited"` limit the bar stays empty and `aria-valuemax` equals
+ * the amount used (at least 1), so the values stay valid.
  */
 export function UsageMeter<C extends AnyCatalog = AnyCatalog>(
-  _props: UsageMeterProps<C>,
+  props: UsageMeterProps<C>,
 ): ReactNode {
-  return null;
+  const { entitlements, limitKey, catalog, className, barClassName } = props;
+  const labels: UsageMeterLabels = { ...defaultLabels, ...props.labels };
+  const outer = join("w-full space-y-1", className);
+  const text = "text-sm text-muted-foreground";
+
+  const usage = entitlements.usage(limitKey);
+  const limit = entitlements.limit(limitKey);
+
+  if (!usage || limit === null) {
+    if (entitlements.error && !entitlements.data) {
+      return (
+        <div className={outer}>
+          <p role="alert" className={text}>
+            {labels.error}
+          </p>
+        </div>
+      );
+    }
+    if (entitlements.isLoading) {
+      return (
+        <div className={outer}>
+          <div
+            role="progressbar"
+            aria-busy="true"
+            aria-valuemin={0}
+            aria-valuetext={labels.loading}
+            className="h-2 w-full overflow-hidden rounded-full bg-muted"
+          />
+          <p className={text}>{labels.loading}</p>
+        </div>
+      );
+    }
+    return null;
+  }
+
+  const { used } = usage;
+  const unlimited = limit === "unlimited";
+  const max = unlimited ? Math.max(used, 1) : Math.max(limit, 1);
+  const now = Math.min(used, max);
+  const percent = unlimited ? 0 : Math.round((now / max) * 100);
+  const valueText = labels.usage({
+    used,
+    limit,
+    limitKey,
+    period: periodOf(catalog, limitKey),
+  });
+
+  return (
+    <div className={outer}>
+      <div
+        role="progressbar"
+        aria-valuenow={now}
+        aria-valuemin={0}
+        aria-valuemax={max}
+        aria-valuetext={valueText}
+        className="h-2 w-full overflow-hidden rounded-full bg-muted"
+      >
+        <div
+          className={join("h-full bg-primary", barClassName)}
+          style={{ width: `${percent}%` }}
+        />
+      </div>
+      <p className={text}>{valueText}</p>
+    </div>
+  );
 }

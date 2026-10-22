@@ -1,6 +1,10 @@
-// BYO_STUB: N11 replaces this file (contracts.md "react/entitlement-gate.tsx")
 import type { ReactNode } from "react";
-import type { AnyCatalog, FeatureKey, PlanKey } from "../catalog";
+import {
+  type AnyCatalog,
+  type FeatureKey,
+  type PlanKey,
+  upgradeTo,
+} from "../catalog";
 import type { UseEntitlementsResult } from "./use-entitlements";
 
 /** What `fallback` receives when the feature isn't allowed. */
@@ -24,10 +28,19 @@ export type EntitlementGateProps<C extends AnyCatalog = AnyCatalog> = {
 
 /**
  * Renders `children` when the feature is allowed, else `fallback(result)`.
- * No markup of its own. Stub: renders nothing.
+ * No markup of its own. While loading the feature is not allowed, so
+ * `fallback` runs with `isLoading: true`.
  */
 export function EntitlementGate<C extends AnyCatalog = AnyCatalog>(
-  _props: EntitlementGateProps<C>,
+  props: EntitlementGateProps<C>,
 ): ReactNode {
-  return null;
+  const { entitlements, feature, catalog, children, fallback } = props;
+  if (entitlements.hasFeature(feature)) return children ?? null;
+  if (!fallback) return null;
+  return fallback({
+    allowed: false,
+    key: feature,
+    isLoading: entitlements.isLoading,
+    upgradeTo: catalog ? upgradeTo(catalog, { feature }) : [],
+  });
 }
