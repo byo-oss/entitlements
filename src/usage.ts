@@ -1,6 +1,19 @@
-// BYO_STUB: N04 replaces this file (contracts.md "usage.ts")
 import type { DBTransactionAdapter } from "better-auth";
-import type { EntitlementsRuntime } from "./runtime";
+import {
+  isFeatureKey,
+  type LimitValue,
+  limitKind,
+  type MeteredPeriod,
+  planEntitlements,
+  upgradeTo,
+} from "./catalog";
+import { emit, entitlementsEvent } from "./events";
+import type { EntitlementsCheckOperation } from "./options";
+import { bucketKey, periodFor, type UsagePeriod } from "./period";
+import { resolveState } from "./resolve";
+import { type EntitlementsRuntime, singleFlight } from "./runtime";
+import type { EntitlementUsageRow } from "./schema";
+import { assertOutsideTransaction, currentAdapter } from "./txn";
 import type {
   ConsumeResult,
   FeatureCheckResult,
@@ -10,12 +23,118 @@ import type {
   UsageInfo,
 } from "./types";
 
+const PREFIX = "[@byo-oss/entitlements]";
+const USAGE_MODEL = "entitlementUsage";
+
+/** What a key must be for an operation, as `UNKNOWN_KEY` names it. */
+export type KeyKind = "feature" | "metered limit" | "capacity limit" | "limit";
+
 /**
- * `consumeUsage` (metered keys only), per PRD Checks: guarded
- * `incrementOne` first; on `null`, `findOne` the bucket, create it through
- * `singleFlight` keyed by bucket (re-read on a create error), retry once;
- * refused calls don't count `used` but increment `refused`, and the first
- * refusal per period emits `entitlements.usage.limit_reached`.
+ * Throws `[@byo-oss/entitlements] UNKNOWN_KEY: <operation> got "<key>", which
+ * isn't a <kind> of the catalog` unless `key` is one (a programmer error the
+ * types would have refused, not a refusal).
+ */
+export function assertKey(
+  rt: EntitlementsRuntime,
+  operation: string,
+  key: unknown,
+  kind: KeyKind,
+): asserts key is string {
+  const ok =
+    typeof key === "string" &&
+    (kind === "feature"
+      ? isFeatureKey(rt.catalog, key)
+      : kind === "limit"
+        ? limitKind(rt.catalog, key) !== null
+        : limitKind(rt.catalog, key) ===
+          (kind === "metered limit" ? "metered" : "capacity"));
+  if (!ok) {
+    throw new Error(
+      `${PREFIX} UNKNOWN_KEY: ${operation} got "${String(key)}", which isn't a ${kind} of the catalog`,
+    );
+  }
+}
+
+/** `rt.options.onError`'s answer as `allowed`. */
+export function onErrorAllows(
+  rt: EntitlementsRuntime,
+  error: unknown,
+  info: {
+    organizationId: string;
+    key: string;
+    operation: EntitlementsCheckOperation;
+  },
+): boolean {
+  return rt.options.onError(error, info) === "allow";
+}
+
+const meteredPeriod = (rt: EntitlementsRuntime, key: string): MeteredPeriod =>
+  (rt.catalog.limits as Record<string, { period: MeteredPeriod }>)[key]
+    ?.period as MeteredPeriod;
+
+const remainingOf = (limit: LimitValue, used: number): number | "unlimited" =>
+  limit === "unlimited" ? "unlimited" : Math.max(0, limit - used);
+
+const limitUpgrade = (rt: EntitlementsRuntime, key: string, atLeast: number) =>
+  upgradeTo(rt.catalog, { limit: key, atLeast });
+
+const findBucket = (adapter: DBTransactionAdapter, bucket: string) =>
+  adapter.findOne<EntitlementUsageRow>({
+    model: USAGE_MODEL,
+    where: [{ field: "bucket", value: bucket }],
+  });
+
+/**
+ * Makes sure the bucket row exists. One create per bucket at a time in this
+ * process (`singleFlight("bucket:<bucket>")`); inside the flight it re-reads
+ * first (a caller can arrive after an earlier flight settled), and on a
+ * create error (another process won the unique `bucket`) re-reads and
+ * rethrows only when the row is still missing.
+ */
+async function ensureBucket(
+  rt: EntitlementsRuntime,
+  adapter: DBTransactionAdapter,
+  input: {
+    bucket: string;
+    organizationId: string;
+    key: string;
+    period: UsagePeriod;
+  },
+): Promise<void> {
+  await singleFlight(rt, `bucket:${input.bucket}`, async () => {
+    if (await findBucket(adapter, input.bucket)) return;
+    const now = rt.now();
+    try {
+      await adapter.create<
+        Omit<EntitlementUsageRow, "id">,
+        EntitlementUsageRow
+      >({
+        model: USAGE_MODEL,
+        data: {
+          bucket: input.bucket,
+          organizationId: input.organizationId,
+          key: input.key,
+          periodStart: input.period.start,
+          periodEnd: input.period.end,
+          used: 0,
+          refused: 0,
+          createdAt: now,
+          updatedAt: now,
+        },
+      });
+    } catch (error) {
+      if (await findBucket(adapter, input.bucket)) return;
+      throw error;
+    }
+  });
+}
+
+/**
+ * `consumeUsage` (metered keys only), per the PRD's Checks steps 1–4:
+ * guarded `incrementOne` first; on `null`, `findOne` the bucket, create it
+ * through `singleFlight` keyed by bucket (re-read on a create error), retry
+ * once; refused calls don't count `used` but increment `refused`, and the
+ * first refusal per period emits `entitlements.usage.limit_reached`.
  * `amount` (default 1) must be a positive integer.
  * Throws `[@byo-oss/entitlements] consumeUsage must run outside a
  * transaction` inside one, and `[@byo-oss/entitlements] UNKNOWN_KEY: …` for
@@ -24,25 +143,146 @@ import type {
  * "consumeUsage" })` with `reason: "error"`: a degraded `resolveState`
  * answers with `state.error` and is not logged again (the read logged it);
  * a failure of this function's own queries is logged once.
- * Stub: refuses without touching the database.
  */
 export async function consumeUsage(
   rt: EntitlementsRuntime,
-  _organizationId: string,
+  organizationId: string,
   key: string,
-  _opts?: { amount?: number },
+  opts?: { amount?: number },
 ): Promise<ConsumeResult> {
+  await assertOutsideTransaction(rt, "consumeUsage");
+  assertKey(rt, "consumeUsage", key, "metered limit");
+  const amount = opts?.amount ?? 1;
+  if (!Number.isInteger(amount) || amount < 1) {
+    throw new Error(
+      `${PREFIX} consumeUsage: amount must be a positive integer`,
+    );
+  }
+
+  const state = await resolveState(rt, organizationId);
+  const now = rt.now();
+  const plan = state.result.plan.key;
+  const limit = state.result.limits[key] as LimitValue;
+  const period = periodFor(meteredPeriod(rt, key), state, now);
+  const info = { organizationId, key, operation: "consumeUsage" as const };
+  const errorResult = (error: unknown): ConsumeResult => ({
+    allowed: onErrorAllows(rt, error, info),
+    reason: "error",
+    key,
+    plan,
+    upgradeTo: [],
+    used: 0,
+    limit,
+    remaining: remainingOf(limit, 0),
+    resetAt: period.end,
+    firstRefusal: false,
+  });
+  if (state.result.degraded) return errorResult(state.error);
+
+  const bucket = bucketKey(organizationId, key, period.start);
+  const target = { bucket, organizationId, key, period };
+  let refusal: EntitlementUsageRow | null;
+  let firstRefusal: boolean;
+  try {
+    const adapter = await currentAdapter(rt);
+    if (limit === "unlimited" || amount <= limit) {
+      const consume = () =>
+        adapter.incrementOne<EntitlementUsageRow>({
+          model: USAGE_MODEL,
+          where:
+            limit === "unlimited"
+              ? [{ field: "bucket", value: bucket }]
+              : [
+                  { field: "bucket", value: bucket },
+                  { field: "used", operator: "lte", value: limit - amount },
+                ],
+          increment: { used: amount },
+          set: { updatedAt: now },
+        });
+      let row = await consume();
+      if (!row && !(await findBucket(adapter, bucket))) {
+        await ensureBucket(rt, adapter, target);
+        row = await consume();
+      }
+      if (row) {
+        return {
+          allowed: true,
+          reason: "ok",
+          key,
+          plan,
+          upgradeTo: limitUpgrade(rt, key, row.used),
+          used: row.used,
+          limit,
+          remaining: remainingOf(limit, row.used),
+          resetAt: period.end,
+          firstRefusal: false,
+        };
+      }
+      if (limit === "unlimited") {
+        throw new Error(
+          `${PREFIX} consumeUsage: the usage bucket ${bucket} disappeared`,
+        );
+      }
+      // the bucket exists: the guard refused
+    } else {
+      // amount > limit (a 0 limit included): refused before any consume, so
+      // the bucket may not exist yet
+      await ensureBucket(rt, adapter, target);
+    }
+    // the first refusal is the increment that moves `refused` from 0 to 1;
+    // decided by the guard rather than the returned row, because an adapter
+    // may hand back a row object that later increments have already changed
+    const refuse = (first: boolean) =>
+      adapter.incrementOne<EntitlementUsageRow>({
+        model: USAGE_MODEL,
+        where: first
+          ? [
+              { field: "bucket", value: bucket },
+              { field: "refused", value: 0 },
+            ]
+          : [{ field: "bucket", value: bucket }],
+        increment: { refused: 1 },
+        set: { updatedAt: now },
+      });
+    refusal = await refuse(true);
+    firstRefusal = refusal !== null;
+    refusal ??= await refuse(false);
+    if (!refusal) {
+      throw new Error(
+        `${PREFIX} consumeUsage: the usage bucket ${bucket} disappeared`,
+      );
+    }
+  } catch (error) {
+    rt.logger.error(
+      `${PREFIX} consumeUsage failed for organization ${organizationId} (${key}); answering onError`,
+      error,
+    );
+    return errorResult(error);
+  }
+
+  const numericLimit = limit as number;
+  if (firstRefusal) {
+    await emit(
+      rt,
+      entitlementsEvent("entitlements.usage.limit_reached", {
+        organizationId,
+        actorId: null,
+        data: { key, limit: numericLimit, periodEnd: period.end },
+        occurredAt: rt.now(),
+      }),
+    );
+  }
   return {
     allowed: false,
     reason: "limit_reached",
     key,
-    plan: rt.catalog.defaultPlan,
-    upgradeTo: [],
-    used: 0,
-    limit: 0,
-    remaining: 0,
-    resetAt: rt.now(),
-    firstRefusal: false,
+    plan,
+    upgradeTo: limitUpgrade(rt, key, refusal.used + amount),
+    used: refusal.used,
+    limit,
+    remaining: remainingOf(limit, refusal.used),
+    resetAt: period.end,
+    firstRefusal,
   };
 }
 
@@ -52,64 +292,162 @@ export async function consumeUsage(
  * bucket. `remaining = max(0, limit - used)`, or `"unlimited"`. A query
  * error throws; it never logs (its caller logs once: `getLimit`, or the
  * read endpoints, which answer 503).
- * Stub: `used: 0`.
  */
 export async function readUsage(
   rt: EntitlementsRuntime,
-  _adapter: DBTransactionAdapter,
-  _organizationId: string,
-  _key: string,
-  _state: ResolvedState,
+  adapter: DBTransactionAdapter,
+  organizationId: string,
+  key: string,
+  state: ResolvedState,
 ): Promise<UsageInfo> {
-  return { used: 0, remaining: 0, resetAt: rt.now() };
+  const period = periodFor(meteredPeriod(rt, key), state, rt.now());
+  const row = await findBucket(
+    adapter,
+    bucketKey(organizationId, key, period.start),
+  );
+  const used = row?.used ?? 0;
+  const limit = state.result.limits[key] as LimitValue;
+  return { used, remaining: remainingOf(limit, used), resetAt: period.end };
+}
+
+/** `allowed`/`reason` of a limit: 0 → not in plan; nothing left → limit reached. */
+function limitVerdict(
+  limit: LimitValue,
+  remaining: number | "unlimited" | null,
+): Pick<LimitResult, "allowed" | "reason"> {
+  if (limit === 0) return { allowed: false, reason: "not_in_plan" };
+  if (remaining === 0) return { allowed: false, reason: "limit_reached" };
+  return { allowed: true, reason: "ok" };
 }
 
 /**
  * `getLimit` for any kind: `{ limit, degraded, ... }`; metered keys also
  * get `{ used, remaining, resetAt }` (`readUsage`; no bucket is created).
  * `allowed`/`reason`: `"not_in_plan"` when the limit is 0, metered keys
- * `"limit_reached"` when `remaining` is 0, else `"ok"`. A failure answers
- * `defaultPlan` with `degraded: true` (`reason: "error"`): a degraded
- * `resolveState` is not logged again (the read logged it); a `readUsage`
- * throw is logged once here.
- * Throws `UNKNOWN_KEY` for a key that isn't a limit.
- * Stub: limit 0, not degraded.
+ * `"limit_reached"` when `remaining` is 0, else `"ok"`; `upgradeTo` lists
+ * the plans with at least 1 (metered: `used + 1`). A failure answers
+ * `defaultPlan` with `degraded: true`, `allowed: false` and
+ * `reason: "error"`: a degraded `resolveState` is not logged again (the read
+ * logged it); a `readUsage` throw is logged once here.
+ * Throws `UNKNOWN_KEY` for a key that isn't a limit. Works inside a
+ * transaction.
  */
 export async function getLimit(
   rt: EntitlementsRuntime,
-  _organizationId: string,
+  organizationId: string,
   key: string,
 ): Promise<LimitResult | MeteredLimitResult> {
+  assertKey(rt, "getLimit", key, "limit");
+  const metered = limitKind(rt.catalog, key) === "metered";
+  const state = await resolveState(rt, organizationId);
+
+  const failed = (
+    plan: string,
+    limit: LimitValue,
+  ): LimitResult | MeteredLimitResult => {
+    const base: LimitResult = {
+      allowed: false,
+      reason: "error",
+      key,
+      plan,
+      upgradeTo: [],
+      limit,
+      degraded: true,
+    };
+    if (!metered) return base;
+    const period = periodFor(meteredPeriod(rt, key), state, rt.now());
+    return {
+      ...base,
+      used: 0,
+      remaining: remainingOf(limit, 0),
+      resetAt: period.end,
+    };
+  };
+
+  if (state.result.degraded) {
+    return failed(
+      state.result.plan.key,
+      state.result.limits[key] as LimitValue,
+    );
+  }
+  const plan = state.result.plan.key;
+  const limit = state.result.limits[key] as LimitValue;
+  if (!metered) {
+    return {
+      ...limitVerdict(limit, null),
+      key,
+      plan,
+      upgradeTo: limitUpgrade(rt, key, 1),
+      limit,
+      degraded: false,
+    };
+  }
+  let usage: UsageInfo;
+  try {
+    usage = await readUsage(
+      rt,
+      await currentAdapter(rt),
+      organizationId,
+      key,
+      state,
+    );
+  } catch (error) {
+    rt.logger.error(
+      `${PREFIX} getLimit failed to read usage for organization ${organizationId} (${key}); answering defaultPlan (degraded)`,
+      error,
+    );
+    const fallback = rt.catalog.defaultPlan as string;
+    return failed(
+      fallback,
+      planEntitlements(rt.catalog, fallback).limits[key] as LimitValue,
+    );
+  }
   return {
-    allowed: false,
-    reason: "not_in_plan",
+    ...limitVerdict(limit, usage.remaining),
     key,
-    plan: rt.catalog.defaultPlan,
-    upgradeTo: [],
-    limit: 0,
+    plan,
+    upgradeTo: limitUpgrade(rt, key, usage.used + 1),
+    limit,
     degraded: false,
+    ...usage,
   };
 }
 
 /**
  * `hasFeature`: `allowed` = the resolved feature value; `reason`
- * `"not_in_plan"` when false, with `upgradeTo`. A degraded `resolveState`
- * answers `rt.options.onError(state.error, { organizationId, key,
- * operation: "hasFeature" })` with `reason: "error"` and doesn't log again
- * (the read logged it). Throws `UNKNOWN_KEY` for a key that isn't a
- * feature.
- * Stub: not allowed.
+ * `"not_in_plan"` when false; `upgradeTo` lists the plans with the feature.
+ * A degraded `resolveState` answers `rt.options.onError(state.error, {
+ * organizationId, key, operation: "hasFeature" })` with `reason: "error"`
+ * and doesn't log again (the read logged it). Throws `UNKNOWN_KEY` for a key
+ * that isn't a feature. Works inside a transaction.
  */
 export async function hasFeature(
   rt: EntitlementsRuntime,
-  _organizationId: string,
+  organizationId: string,
   feature: string,
 ): Promise<FeatureCheckResult> {
+  assertKey(rt, "hasFeature", feature, "feature");
+  const state = await resolveState(rt, organizationId);
+  const plan = state.result.plan.key;
+  if (state.result.degraded) {
+    return {
+      allowed: onErrorAllows(rt, state.error, {
+        organizationId,
+        key: feature,
+        operation: "hasFeature",
+      }),
+      reason: "error",
+      key: feature,
+      plan,
+      upgradeTo: [],
+    };
+  }
+  const allowed = state.result.features[feature] === true;
   return {
-    allowed: false,
-    reason: "not_in_plan",
+    allowed,
+    reason: allowed ? "ok" : "not_in_plan",
     key: feature,
-    plan: rt.catalog.defaultPlan,
-    upgradeTo: [],
+    plan,
+    upgradeTo: upgradeTo(rt.catalog, { feature }),
   };
 }
