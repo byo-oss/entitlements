@@ -6,7 +6,7 @@ Plan entitlements as a better-auth plugin: a typed catalog of plans, features an
 
 The same steps, with checks, ship as a skill: `skills/byo-entitlements/SKILL.md` (`npx skills add byo-oss/entitlements`). Keep the two, and the README's Setup section, in step when setup changes.
 
-1. **Catalog and plugin.** `npm install @byo-oss/entitlements`. Required peers: `better-auth` `^1.7.7`, `better-call` `^1.4.0`, `@better-auth/core` `^1.7.7` and `zod` `^4.0.0` (better-auth already brings core and zod 4; add them on a strict package manager). Write the catalog with `defineEntitlements` from `@byo-oss/entitlements/catalog`, then add `entitlements({ catalog, staffOrganizationId })` to `betterAuth({ plugins })` after `organization()`. Without a `source`, every organization is on `defaultPlan`; add `fromBetterAuthStripe()` from `@byo-oss/entitlements/stripe` when the app uses `@better-auth/stripe` with organization subscriptions.
+1. **Catalog and plugin.** `npm install @byo-oss/entitlements`. Required peers: `better-auth` `^1.7.7`, `better-call` `^1.4.0`, `@better-auth/core` `^1.7.7` and `zod` `^4.0.0` (better-auth already brings core and zod 4; add them on a strict package manager). A package that imports only `/catalog` (a static site, a shared `plans` package in a monorepo) still installs the peers: pnpm's `auto-install-peers` (the default) covers it, otherwise list them. Write the catalog with `defineEntitlements` from `@byo-oss/entitlements/catalog`, then add `entitlements({ catalog, staffOrganizationId })` to `betterAuth({ plugins })` after `organization()` (order against `stripe()` is free). Typecheck now; the app boots after step 3, since SQL schemas check tables at boot. Without a `source`, every organization is on `defaultPlan`; add `fromBetterAuthStripe()` from `@byo-oss/entitlements/stripe` when the app uses `@better-auth/stripe` with organization subscriptions and plans (Stripe mounted without plans: no `source`).
 2. **Statements into `ac`.** Spread `entitlementsStatements` into `createAccessControl` and give roles `entitlements: ["read"]` (members) or `["read", "override"]` (owner, admin). Pass `ac` and `roles` to `organization()`.
 3. **Migration.** `npx @better-auth/cli migrate`, or `generate` and then the repo's drizzle or prisma flow. It adds `entitlementSnapshot`, `entitlementOverride` and `entitlementUsage`. On MongoDB, create unique indexes on `entitlementSnapshot.organizationId` and `entitlementUsage.bucket`.
 4. **Client plugin.** Add `entitlementsClient()` from `@byo-oss/entitlements/client` next to `organizationClient()`.
@@ -20,7 +20,8 @@ Optional: render `useEntitlements`, `EntitlementGate` and `UsageMeter` from `@by
 - `consumeUsage`, `sync(orgId)` and `refreshEntitlements` throw inside a transaction. Call them before or after it. Reads and `checkCapacity` work inside one, and the sweep (`processEntitlementsSync`, `byo.sweep`) joins it. Events from a write inside a transaction fire after it commits and never on a rollback; outside one they fire when the write returns.
 - Every duration option is in milliseconds except `pastDueGraceDays`. `maxAge` must be at least 60000; `usageRetention` and `overrideRetention` at least 86400000.
 - Never rename a plan key that has subscribers; add a `planAliases` entry. Prices live in Stripe, not the catalog.
-- Staff overrides are checked in `staffOrganizationId`, never in the target organization. Without it (or a custom `authorize`) the override endpoints deny every call.
+- Staff overrides are checked in `staffOrganizationId`, never in the target organization; a non-staff caller always gets 404 on the override endpoints. Without it (or a custom `authorize`) they deny every call. A `plan` override takes no `value`.
+- A seat count (for `checkCapacity`) skips expired invitations: better-auth keeps them at `status: "pending"`, so also require `expiresAt` in the future.
 - The default `acceptSession` refuses impersonated sessions only (on staff calls and every POST). Refusing API-key or bearer sessions on the override endpoints is an app choice. A custom `acceptSession` replaces the default, so it keeps the impersonation rule and adds its own:
 
   ```ts
@@ -30,7 +31,8 @@ Optional: render `useEntitlements`, `EntitlementGate` and `UsageMeter` from `@by
   export const acceptSession: EntitlementsAcceptSession = ({ session, kind, method, path, headers }) => {
     if (session.session.impersonatedBy && (kind === "staff" || method === "POST")) return false
     const bearer = headers?.get("authorization")?.startsWith("Bearer ")
-    if (path.startsWith("/entitlements/override") && (bearer || headers?.has("x-api-key"))) return false
+    const overridePaths = ["/entitlements/override/set", "/entitlements/override/remove", "/entitlements/overrides"]
+  if (overridePaths.includes(path) && (bearer || headers?.has("x-api-key"))) return false
     return true
   }
   ```

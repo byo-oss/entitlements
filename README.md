@@ -20,7 +20,7 @@ npm install @byo-oss/entitlements
 npm install @byo-oss/entitlements
 ```
 
-Required peer dependencies: `better-auth` `^1.7.7`, `better-call` `^1.4.0`, `@better-auth/core` `^1.7.7` (at the same version as `better-auth`) and `zod` `^4.0.0`. better-auth already depends on `@better-auth/core` and zod 4, so npm and pnpm resolve them; install them yourself when your package manager is strict about peers (Yarn). An app still on zod 3 has to move to zod 4 first. Optional peers: `@better-auth/stripe` `^1.7.7` (for `@byo-oss/entitlements/stripe`), `react` (for `/react`) and `vitest` (for `/testing`).
+Required peer dependencies: `better-auth` `^1.7.7`, `better-call` `^1.4.0`, `@better-auth/core` `^1.7.7` (at the same version as `better-auth`) and `zod` `^4.0.0`. better-auth already depends on `@better-auth/core` and zod 4, so npm and pnpm resolve them; install them yourself when your package manager is strict about peers (Yarn). An app still on zod 3 has to move to zod 4 first. A package that only imports `@byo-oss/entitlements/catalog` (a static site, a shared plans package in a monorepo) still installs the package's peers, even though the catalog code imports nothing. With pnpm, `auto-install-peers` (on by default) installs them; with `auto-install-peers=false`, npm 6 or Yarn, list `better-auth`, `better-call`, `@better-auth/core` and `zod` in that package's dependencies. Optional peers: `@better-auth/stripe` `^1.7.7` (for `@byo-oss/entitlements/stripe`), `react` (for `/react`) and `vitest` (for `/testing`).
 
 | Subpath | What it holds |
 |---|---|
@@ -30,6 +30,17 @@ Required peer dependencies: `better-auth` `^1.7.7`, `better-call` `^1.4.0`, `@be
 | `@byo-oss/entitlements/react` | `useEntitlements`, `EntitlementGate`, `UsageMeter` |
 | `@byo-oss/entitlements/stripe` | `fromBetterAuthStripe()` and `stripePlans()` |
 | `@byo-oss/entitlements/testing` | `memorySource()` and the `testBillingSource` contract suite (ESM only) |
+
+**In a monorepo,** keep the catalog in one shared `plans` package that imports only `@byo-oss/entitlements/catalog`, and have the server, the web app and the static site import that package:
+
+```
+packages/plans/       the catalog (defineEntitlements), imports only /catalog
+apps/api/             betterAuth({ plugins: [entitlements({ catalog })] }), imports plans
+apps/web/             entitlementsClient(), /react, imports plans for the types
+apps/site/            the pricing page, imports plans
+```
+
+Add `@byo-oss/entitlements` to every package that imports it, `plans` included, and give each the peers as above. The plugin, the client plugin and the React components stay in the apps that use them.
 
 ## Setup
 
@@ -84,11 +95,12 @@ Five steps. Each ends on a check.
    })
    ```
 
-   - With no `source`, every organization is on `defaultPlan` (plus overrides). That is enough for dev and tests; add `fromBetterAuthStripe()` under Billing sources when you take payments.
+   - With no `source`, every organization is on `defaultPlan` (plus overrides). That is enough for dev and tests; add `fromBetterAuthStripe()` under Billing sources when you take payments (the Stripe plugin must be mounted with plans for that).
+   - Where `entitlements()` sits relative to `stripe()` does not matter: a source connects in `init`. Only `organization()` has to come first.
    - Without the organization plugin, boot fails with `ORGANIZATION_PLUGIN_REQUIRED`. Without `staffOrganizationId` (or a custom `authorize`), the override endpoints deny every call and boot logs one warning.
    - Never rename a plan key that has subscribers. Add a `planAliases` entry from the old key to the current plan instead.
 
-   Done when the app typechecks and boots.
+   Done when the app typechecks. It boots after step 3: on a SQL schema (Drizzle, Prisma, Kysely) better-auth checks that its tables exist at boot and refuses until the migration is applied.
 
 2. **Statements into `ac`.** Spread `entitlementsStatements` into your access control and give your roles `entitlements` actions.
 
@@ -154,7 +166,7 @@ Five steps. Each ends on a check.
 - Plan keys match `/^[a-z][a-z0-9_-]*$/`, because `@better-auth/stripe` lowercases plan names. At most 150 feature and limit keys together.
 - Limit kinds:
   - `metered` with a `period`: counted by `consumeUsage`. `day` and `month` are UTC calendar periods; `billing` follows the snapshot's subscription period while the organization is entitled and in period, else the UTC month.
-  - `capacity`: you pass the current count to `checkCapacity` (you know which roles are free).
+  - `capacity`: you pass the current count to `checkCapacity` (you know which roles are free). For seats, count members, plus pending invitations when they hold a seat, and skip expired invitations: better-auth leaves an invitation at `status: "pending"` after it expires, so filter on `expiresAt` being in the future as well.
   - `value`: a plan setting you read with `getLimit`, such as `retentionDays`.
 - `upgradeTo(catalog, { feature: "sso" })` and `upgradeTo(catalog, { limit: "projects", atLeast: 10 })` return the plan keys that would unlock it, in catalog order.
 - The catalog passed to `createEntitlements` must be the one the plugin was given (same reference, else deep equality), or the first call throws `[@byo-oss/entitlements] createEntitlements got a different catalog than the plugin`.
@@ -187,7 +199,7 @@ Every duration is in milliseconds except `pastDueGraceDays` (days). A value give
 
 Boot validation throws `[@byo-oss/entitlements] …` for: a bad catalog (missing or unknown key, bad plan key, bad limit, bad alias, more than 150 keys), `defaultPlan` not in `plans`, an empty `staffOrganizationId`, a source without a non-empty `id` or a `resolve` function (`"none"` is reserved), and a numeric option out of range.
 
-The default `acceptSession` refuses impersonated sessions and nothing else. Refusing API-key and bearer callers on the override endpoints is your choice; a custom `acceptSession` replaces the default, so it keeps the impersonation rule and adds that one:
+The default `acceptSession` refuses impersonated sessions and nothing else. Refusing API-key and bearer callers on the override endpoints is your choice; a custom `acceptSession` replaces the default, so it keeps the impersonation rule and adds that one. Match the three override paths exactly, as below, rather than by prefix, so what the rule covers is on the page:
 
 ```ts
 // lib/auth-options.ts
@@ -208,9 +220,10 @@ export const auth = betterAuth({
       acceptSession: ({ session, kind, method, path, headers }) => {
         // the default's rule: no impersonated sessions on staff calls or POSTs
         if (session.session.impersonatedBy && (kind === "staff" || method === "POST")) return false
-        // your own rule: no bearer or API-key callers on the override endpoints
+        // your own rule: no bearer or API-key callers on the override endpoints (exact paths, the GET list included)
         const bearer = headers?.get("authorization")?.startsWith("Bearer ")
-        if (path.startsWith("/entitlements/override") && (bearer || headers?.has("x-api-key"))) return false
+        const overridePaths = ["/entitlements/override/set", "/entitlements/override/remove", "/entitlements/overrides"]
+        if (overridePaths.includes(path) && (bearer || headers?.has("x-api-key"))) return false
         return true
       },
     }),
@@ -228,7 +241,7 @@ Endpoints need a session. There is no credential-free route. GET endpoints: `/en
 |---|---|---|---|---|
 | `getEntitlements` | GET `/entitlements/get` | gated: `entitlements:read` in `organizationId`, or in the staff organization | `organizationId` | the resolved result plus `usage` per metered key (`{ used, remaining, resetAt }`). Staff callers also get each override's `id`, `reason` and `createdBy` |
 | `refreshEntitlements` | POST `/entitlements/refresh` | gated, same rule | `organizationId` | the same, after a sync that bypasses the cache. Call it when the user returns from checkout |
-| `setEntitlementOverride` | POST `/entitlements/override/set` | gated: `entitlements:override` in the staff organization | `organizationId, kind, key, value, reason, expiresAt?` | `{ override }` |
+| `setEntitlementOverride` | POST `/entitlements/override/set` | gated: `entitlements:override` in the staff organization | `organizationId, kind, key, value?, reason, expiresAt?` (`value` is required for `feature` and `limit` and ignored for `plan`) | `{ override }` |
 | `removeEntitlementOverride` | POST `/entitlements/override/remove` | gated: `entitlements:override` in the staff organization | `id` | `{ ok: true }` |
 | `listEntitlementOverrides` | GET `/entitlements/overrides` | gated: `entitlements:read` in the staff organization | `organizationId?, status?, cursor?` | `{ overrides, nextCursor }`, newest first, up to 50 per page |
 | `processEntitlementsSync` | none | server-only | none | `{ synced, skipped, retrying, failed, expired, pruned, hasMore }` |
@@ -273,14 +286,19 @@ Result rules:
 // lib/guard.ts (server only)
 import { gate } from "./gate"
 
-export async function guardApiCall(organizationId: string): Promise<Response | null> {
+// Pass the response headers so a successful call can carry the ratelimit-* headers too.
+export async function guardApiCall(organizationId: string, headers: Headers): Promise<Response | null> {
   const r = await gate.consumeUsage(organizationId, "apiCalls")
+  const reset = String(Math.ceil((r.resetAt.getTime() - Date.now()) / 1000))
+  // `limit` and `remaining` are numbers or "unlimited" (an override can lift the cap), so send the pair only when both are numbers
+  if (typeof r.limit === "number" && typeof r.remaining === "number") {
+    headers.set("ratelimit-limit", String(r.limit))
+    headers.set("ratelimit-remaining", String(r.remaining))
+    headers.set("ratelimit-reset", reset)
+  }
   if (r.allowed) return null
-  const status = r.reason === "error" ? 503 : 429
-  return new Response("Limit reached", {
-    status,
-    headers: { "retry-after": String(Math.ceil((r.resetAt.getTime() - Date.now()) / 1000)) },
-  })
+  headers.set("retry-after", reset)
+  return new Response("Limit reached", { status: r.reason === "error" ? 503 : 429, headers })
 }
 ```
 
@@ -293,13 +311,13 @@ export async function guardApiCall(organizationId: string): Promise<Response | n
 For `getEntitlements` and `refreshEntitlements`:
 
 1. `authorize` in the target organization (`kind: "member"`); if that fails, `authorize` in the staff organization (`kind: "staff"`). Override endpoints always use the staff organization.
-2. Neither passes: 404 `ORGANIZATION_NOT_FOUND`, whether or not the organization exists.
+2. Neither passes: 404 `ORGANIZATION_NOT_FOUND`, whether or not the organization exists. On the override endpoints a caller outside the staff organization always gets this 404, never a 403.
 3. `acceptSession`; `false` answers 403 `SESSION_NOT_ACCEPTED`. The default refuses an impersonated session (`session.session.impersonatedBy`) on staff calls and on every POST, and allows impersonated member reads.
 4. On a staff path the target organization must exist, else 404.
 
 The default `authorize` looks up the caller's `member` row in the organization it is asked about and runs the organization plugin's `hasPermission` for that role. It never looks at role names or the session's active organization.
 
-Override rules: `key` must be in the catalog for its `kind` (a plan alias is not a plan key); a `feature` value is a boolean; a `limit` value is a non-negative integer or `"unlimited"`; a `plan` override takes no value; `expiresAt`, if given, is in the future; `reason` is 1 to 500 characters. Anything else is 400 `INVALID_OVERRIDE`. An override replaces the plan's value rather than taking the larger, so staff can also restrict. Setting a new override for the same `(organization, kind, key)` marks the old one `removed`; there is at most one live plan override per organization.
+Override rules: `key` must be in the catalog for its `kind` (a plan alias is not a plan key); a `feature` value is a boolean; a `limit` value is a non-negative integer or `"unlimited"`; a `plan` override takes no `value` (leave it out; a `value` sent anyway is ignored); `expiresAt`, if given, is in the future; `reason` is 1 to 500 characters. Anything else is 400 `INVALID_OVERRIDE`. An override replaces the plan's value rather than taking the larger, so staff can also restrict. Setting a new override for the same `(organization, kind, key)` marks the old one `removed`; there is at most one live plan override per organization.
 
 ### Errors
 
@@ -455,6 +473,8 @@ export const auth = betterAuth({
 ```
 
 - `stripePlans` sets each plan's `name` to the plan key and its `limits` to the catalog's limits. Those are for the Stripe plugin's own display and are never read back; Stripe holds which plan and status, the catalog holds what the plan allows.
+- The Stripe plugin must be mounted with plans (`subscription: { enabled: true, plans }`). An app that mounts Stripe without plans passes no `source` to `entitlements()` (the source fails boot when `subscription.enabled` is off).
+- Plugin order against `stripe()` is free: the source connects in `init`, so `stripe()` may come before or after `entitlements()` (`organization()` still comes first).
 - At boot it fails when a Stripe plan name isn't a catalog plan or alias, when `subscription.enabled` or `organization.enabled` is off, or when the Stripe plugin is missing. A plan with `group` logs a warning: one live plan per organization.
 - It wraps the Stripe plugin's `onEvent` once. On `checkout.session.completed` and `customer.subscription.created`, `.updated` and `.deleted` it finds the organization, resyncs it, then calls your handler. An event for a user, a deleted organization or nothing known answers 200 and resyncs nothing; a failed resync throws, so the webhook answers 400 and Stripe redelivers. Create one `stripe()` plugin per `betterAuth()` instance.
 - `resolve` picks the entitled subscription (active, then trialing, then past_due; latest `periodEnd` breaks ties). With none, it keeps the latest ended row so the snapshot records the last status.
@@ -768,7 +788,7 @@ Not in v0:
 - Abuse rate limits (per IP, per key): better-auth `rateLimit`.
 - Percentage rollouts and temporary flags: your feature-flag tool.
 - Prices in the catalog: prices live in Stripe.
-- Counting seats or members: you supply the count.
+- Counting seats or members: you supply the count (leave out expired invitations).
 
 Later, when someone needs it:
 
