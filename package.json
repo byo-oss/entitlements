@@ -60,7 +60,8 @@
     "pretest:min": "node scripts/copy-src.mjs",
     "test:min": "pnpm --dir tests/min test",
     "typecheck": "tsc --noEmit",
-    "lint": "biome check ."
+    "lint": "biome check .",
+    "docs:check": "node scripts/check-docs-samples.mjs"
   },
   "keywords": [
     "better-auth",
