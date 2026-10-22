@@ -83,11 +83,13 @@
     "access": "public"
   },
   "peerDependencies": {
+    "@better-auth/core": "^1.7.7",
     "@better-auth/stripe": "^1.7.7",
     "better-auth": "^1.7.7",
     "better-call": "^1.4.0",
     "react": ">=18",
-    "vitest": ">=3"
+    "vitest": ">=3",
+    "zod": "^4.0.0"
   },
   "peerDependenciesMeta": {
     "@better-auth/stripe": {
@@ -101,8 +103,7 @@
     }
   },
   "dependencies": {
-    "@byo-oss/core": "^0.1.0",
-    "zod": "^4.6.7"
+    "@byo-oss/core": "^0.1.0"
   },
   "devDependencies": {
     "@better-auth/core": "1.7.12",
@@ -126,6 +127,7 @@
     "stripe": "^22",
     "tsup": "^8.5.1",
     "typescript": "^5.9",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.10",
+    "zod": "4.6.7"
   }
 }

@@ -20,7 +20,7 @@ npm install @byo-oss/entitlements
 npm install @byo-oss/entitlements
 ```
 
-Peer dependencies: `better-auth` `^1.7.7` and `better-call` `^1.4.0`. Optional peers: `@better-auth/stripe` `^1.7.7` (for `@byo-oss/entitlements/stripe`), `react` (for `/react`) and `vitest` (for `/testing`).
+Required peer dependencies: `better-auth` `^1.7.7`, `better-call` `^1.4.0`, `@better-auth/core` `^1.7.7` (at the same version as `better-auth`) and `zod` `^4.0.0`. better-auth already depends on `@better-auth/core` and zod 4, so npm and pnpm resolve them; install them yourself when your package manager is strict about peers (Yarn). An app still on zod 3 has to move to zod 4 first. Optional peers: `@better-auth/stripe` `^1.7.7` (for `@byo-oss/entitlements/stripe`), `react` (for `/react`) and `vitest` (for `/testing`).
 
 | Subpath | What it holds |
 |---|---|
@@ -173,7 +173,7 @@ Every duration is in milliseconds except `pastDueGraceDays` (days). A value give
 | `staffOrganizationId` | none | The vendor's staff organization. An empty string fails boot. |
 | `authorize` | organization-role check | `({ session, headers, organizationId, permissions }) => boolean`. Called with the target organization for member reads and with `staffOrganizationId` for staff calls. |
 | `acceptSession` | refuses impersonated sessions on staff calls and on every POST | `({ session, headers, kind: "member" \| "staff", method, path }) => boolean`. `false` answers 403 `SESSION_NOT_ACCEPTED`. |
-| `onEvent` | none | `(event) => void \| Promise<void>`. Errors are logged and never fail the call. |
+| `onEvent` | none | `(event) => void \| Promise<void>`. For a write inside a transaction it runs after the commit. Errors are logged and never fail the call. |
 | `onError` | `() => "deny"` | `(error, { organizationId, key, operation }) => "allow" \| "deny"`: what `hasFeature`, `consumeUsage` and `checkCapacity` answer when the database or source throws. Always logged. |
 | `cacheTtlMs` | `30000` | In-process cache of resolved entitlements, at most 10 000 organizations. `0` turns it off. Integer, at least 0. Usage counters are never cached. |
 | `maxAge` | `3600000` (1 hour) | A snapshot older than this is served, then refreshed in the background. Integer, **at least 60000** (1 minute). |
@@ -552,11 +552,11 @@ Every function and endpoint reads and writes through better-auth's `getCurrentAd
 
 - `get`, `getMany`, `hasFeature`, `getLimit` and `checkCapacity` work inside a transaction. They may read the cache but never write it, never persist a snapshot (a missing one resolves without writing) and never schedule a refresh; the next read outside a transaction refreshes.
 - `consumeUsage`, `sync(orgId)` and `refreshEntitlements` throw `[@byo-oss/entitlements] <name> must run outside a transaction`, because a bucket or snapshot create could abort your transaction and a consumption rolled back with it would be invisible to others. Call them before or after the transaction.
-- `processEntitlementsSync`, `byo.sweep` and `@byo-oss/core`'s `sweepAll` join your transaction instead of throwing, and roll back with it: the sweep only updates and deletes existing rows, so it can't abort the transaction with a create conflict. Their `plan.changed` events are emitted before you commit.
+- `processEntitlementsSync`, `byo.sweep` and `@byo-oss/core`'s `sweepAll` join your transaction instead of throwing, and roll back with it: the sweep only updates and deletes existing rows, so it can't abort the transaction with a create conflict. Their `plan.changed` events fire after you commit, and never if you roll back.
   - Inside a joined transaction the cache entry is cleared before the commit, so a read made outside the transaction in that window can re-cache the old state until `cacheTtlMs`. Override writes made inside a transaction behave the same way.
   - On Postgres, a database error inside a joined sweep aborts your transaction, so the sweep rejects (it does not report `retrying`) and your commit then fails. Run sweeps outside app transactions unless you want them to roll back together.
 - Override writes (`setEntitlementOverride`, `removeEntitlementOverride`) join the transaction and roll back with it.
-- **Events fire before you commit.** The public `better-auth` entry exports no after-commit hook, so 0.1.0 emits an event when the adapter write returns. Inside a caller's transaction (an override write, or a sweep) an event can therefore announce a write that later rolls back. Emitting after commit is a follow-up.
+- **Events fire after you commit.** An event from a write that joined your transaction (an override write, or a sweep) is queued with better-auth's `queueAfterTransactionHook` and handed to `onEvent` once the transaction commits; if it rolls back, the event is dropped. A write outside a transaction, or on an adapter without real transactions, emits as soon as it returns. An `onEvent` that throws after the commit is logged and fails nothing.
 - The source's `resolve` receives the current adapter.
 
 ## Lifecycle
@@ -605,7 +605,7 @@ export async function purgeOrganization(organizationId: string): Promise<void> {
 
 - **Syncs** write absolute state, so a repeat is harmless.
 - **`consumeUsage`** counts exactly once per call that returns `allowed`, and refusals never count. A caller that retries a call it believes failed can count twice; v0 has no idempotency key.
-- **Events** are best-effort and at most once, in-process. An `onEvent` that throws is logged and never fails the call.
+- **Events** are best-effort and at most once, in-process, and fire only for writes that are durable: after the caller's commit when the write joined a transaction, never on a rollback. An `onEvent` that throws is logged and never fails the call.
 - **Sweeps** are at-least-once. Each row is claimed atomically with a lease, but a lease that expires (`leaseMs`) while a slow sweep is still working lets a second sweep claim the same row. The first sweep's write then loses and only the second one's lands, so the row is resynced once; a resync writes absolute state, so nothing is lost.
 - **Lifecycle cleanup** failures are logged without failing the response; run `deleteOrganizationData` to retry.
 

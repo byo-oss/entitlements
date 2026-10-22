@@ -233,12 +233,14 @@ function selfTest() {
   const pkg = {
     name: "@byo-oss/entitlements",
     exports: exportsMap,
-    dependencies: { zod: "^4", "@byo-oss/core": "^0.1.0" },
+    dependencies: { "@byo-oss/core": "^0.1.0" },
     peerDependencies: {
+      "@better-auth/core": "^1.7.7",
       "better-auth": "^1.7.7",
       "better-call": "^1.4.0",
       "@better-auth/stripe": "^1.7.7",
       react: ">=18",
+      zod: "^4.0.0",
     },
   };
   const clean = {
@@ -334,10 +336,18 @@ function selfTest() {
       rules: [4],
     },
     {
-      name: "rule 4: @better-auth/core at runtime",
+      name: "a declared peer's subpath (@better-auth/core/context) passes",
+      files: {
+        "chunk-A.js":
+          'import { queueAfterTransactionHook } from "@better-auth/core/context";\nexport const x = queueAfterTransactionHook;\n',
+      },
+      rules: [],
+    },
+    {
+      name: "rule 4: an undeclared @better-auth package at runtime",
       files: {
         "client.js":
-          'import { x } from "@better-auth/core/context";\nexport { x };\n',
+          'import { x } from "@better-auth/memory-adapter";\nexport { x };\n',
       },
       rules: [4],
     },

@@ -1,6 +1,6 @@
 # @byo-oss/entitlements
 
-Plan entitlements as a better-auth plugin. A typed catalog of plans, features and limits; per-organization snapshot of the billing state, atomic usage counters and staff overrides, all in the app's own database (any better-auth adapter). Requires better-auth ^1.7.7 and the organization plugin. Organizations only: no user-scoped subscriptions.
+Plan entitlements as a better-auth plugin. A typed catalog of plans, features and limits; per-organization snapshot of the billing state, atomic usage counters and staff overrides, all in the app's own database (any better-auth adapter). Requires better-auth ^1.7.7 and the organization plugin. Required peers: better-auth ^1.7.7, better-call ^1.4.0, @better-auth/core ^1.7.7 (same version as better-auth) and zod ^4.0.0; better-auth already depends on core and zod 4, so add them yourself only on a strict package manager. Organizations only: no user-scoped subscriptions.
 
 ## Install & wire
 
@@ -316,11 +316,11 @@ export async function sweep(): Promise<void> {
 - Everything reads/writes through getCurrentAdapter, so a call in your runWithTransaction joins it.
 - get/getMany/hasFeature/getLimit/checkCapacity work: they never write the cache, never persist a snapshot, never schedule a refresh.
 - consumeUsage, sync(orgId) and refreshEntitlements THROW "[@byo-oss/entitlements] <name> must run outside a transaction": call them before/after.
-- processEntitlementsSync, byo.sweep and @byo-oss/core's sweepAll JOIN the transaction and roll back with it: the sweep only updates and deletes existing rows, so it cannot abort the caller's transaction with a create conflict. Their plan.changed events are emitted before the caller commits.
+- processEntitlementsSync, byo.sweep and @byo-oss/core's sweepAll JOIN the transaction and roll back with it: the sweep only updates and deletes existing rows, so it cannot abort the caller's transaction with a create conflict. Their plan.changed events fire after the caller commits, never on a rollback.
 - Inside a joined transaction the cache entry is cleared before the commit, so a read made outside the transaction in that window can re-cache the old state until cacheTtlMs. Override writes made inside a transaction behave the same way.
 - On Postgres, a database error inside a joined sweep aborts the caller's transaction: the sweep call rejects (it does not report retrying) and the caller's commit then fails. Run sweeps outside app transactions unless you want them to roll back together.
 - Override writes join the transaction too and roll back with it.
-- Events fire when the adapter write returns, not after commit: the public better-auth entry exports no after-commit hook, so in 0.1.0 an event emitted inside a caller's transaction (an override write, a sweep) can announce a write that rolls back. After-commit is a follow-up.
+- Events fire after commit: an event from a write that joined the caller's transaction (an override write, a sweep) is queued with queueAfterTransactionHook (@better-auth/core/context) and reaches onEvent once the transaction commits; a rollback drops it. A write outside a transaction (or on an adapter without real transactions) emits as soon as it returns. A throwing onEvent after commit is logged and fails nothing.
 
 ## Events (onEvent; best-effort, at most once, in-process; no free text)
 

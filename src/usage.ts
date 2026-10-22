@@ -259,8 +259,11 @@ export async function consumeUsage(
   const target = { bucket, organizationId, key, period };
   let refusal: EntitlementUsageRow | null;
   let firstRefusal: boolean;
+  // the adapter the refusal was written with, for the event
+  let written: DBTransactionAdapter | undefined;
   try {
     const adapter = await currentAdapter(rt);
+    written = adapter;
     if (limit === "unlimited" || amount <= limit) {
       const consume = () =>
         adapter.incrementOne<EntitlementUsageRow>({
@@ -346,6 +349,7 @@ export async function consumeUsage(
         data: { key, limit: numericLimit, periodEnd: period.end },
         occurredAt: rt.now(),
       }),
+      written,
     );
   }
   return {

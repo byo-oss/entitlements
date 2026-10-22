@@ -7,13 +7,13 @@ description: Plan entitlements for better-auth apps with @byo-oss/entitlements. 
 
 A better-auth plugin: a typed catalog of plans, features and limits, a per-organization snapshot of the billing state, atomic usage counters and staff overrides, all in the app's own database. Stripe (through `@better-auth/stripe`) says which plan an organization bought; the catalog says what it allows.
 
-The API reference is `node_modules/@byo-oss/entitlements/llms.txt` once the package is installed. Read it before writing calls; this skill covers wiring and the gotchas. Requires `better-auth` `^1.7.7` and the organization plugin.
+The API reference is `node_modules/@byo-oss/entitlements/llms.txt` once the package is installed. Read it before writing calls; this skill covers wiring and the gotchas. Requires `better-auth` `^1.7.7` and the organization plugin. Required peers: `better-auth` `^1.7.7`, `better-call` `^1.4.0`, `@better-auth/core` `^1.7.7` (same version as `better-auth`) and `zod` `^4.0.0`.
 
 ## Setup
 
 Work through these in order. Each step ends on a check; move on only when it holds.
 
-1. **Catalog and plugin.** `npm install @byo-oss/entitlements` (use the repo's package manager). Write the catalog with `defineEntitlements` from `@byo-oss/entitlements/catalog`: `features` (booleans), `limits` (`metered` with a `period` of `day`, `month` or `billing`; `capacity`; `value`), `plans` that set every key, a `defaultPlan`, optional `planAliases`. Add `entitlements({ catalog, staffOrganizationId })` to `betterAuth({ plugins })` **after** `organization()`. With the Stripe plugin, add `source: fromBetterAuthStripe()` from `@byo-oss/entitlements/stripe` and build the Stripe plugin's `plans` with `stripePlans(catalog, { pro: { priceId } })`. Done when the app typechecks and boots; without `staffOrganizationId` the log warns that override endpoints will deny.
+1. **Catalog and plugin.** `npm install @byo-oss/entitlements` (use the repo's package manager; on a strict one such as Yarn also add the peers `better-call`, `@better-auth/core` and `zod`). Write the catalog with `defineEntitlements` from `@byo-oss/entitlements/catalog`: `features` (booleans), `limits` (`metered` with a `period` of `day`, `month` or `billing`; `capacity`; `value`), `plans` that set every key, a `defaultPlan`, optional `planAliases`. Add `entitlements({ catalog, staffOrganizationId })` to `betterAuth({ plugins })` **after** `organization()`. With the Stripe plugin, add `source: fromBetterAuthStripe()` from `@byo-oss/entitlements/stripe` and build the Stripe plugin's `plans` with `stripePlans(catalog, { pro: { priceId } })`. Done when the app typechecks and boots; without `staffOrganizationId` the log warns that override endpoints will deny.
 
    ```ts
    // lib/catalog.ts
@@ -89,7 +89,7 @@ Work through these in order. Each step ends on a check; move on only when it hol
 
 - Gate through `createEntitlements`. Leave the plugin's tables to it; use `auth.api.*`, the client, the React exports and the exported functions.
 - Every duration option is in milliseconds, except `pastDueGraceDays` (days). Floors: `maxAge` 60000, `usageRetention` and `overrideRetention` 86400000. A value in the wrong unit fails boot.
-- `consumeUsage`, `sync(orgId)` and `refreshEntitlements` throw inside a transaction; call them outside. Reads and `checkCapacity` work inside one, and the sweep (`processEntitlementsSync`, `byo.sweep`) joins it. Events fire when the adapter write returns (the public `better-auth` entry has no after-commit hook), so inside a transaction one can announce a write that rolls back.
+- `consumeUsage`, `sync(orgId)` and `refreshEntitlements` throw inside a transaction; call them outside. Reads and `checkCapacity` work inside one, and the sweep (`processEntitlementsSync`, `byo.sweep`) joins it. Events from a write inside a transaction fire after it commits (through `queueAfterTransactionHook`) and never on a rollback; outside one they fire when the write returns.
 - Never rename a plan key that has subscribers; map the old key with `planAliases`.
 - A limit of 0 means "not included": `getLimit`, `consumeUsage` and `checkCapacity` all answer `not_in_plan`. `upgradeTo` lists only plans strictly better on that key than the current plan (never the current or a cheaper one). Cached results are read-only and the result types are `Readonly`; check results and degraded results are plain fresh objects, and Dates are fresh copies per call. Copy before changing.
 - The default `acceptSession` refuses impersonated sessions (`session.session.impersonatedBy`) on staff calls and POSTs, and nothing else. Refusing API-key or bearer sessions on the override endpoints is an app choice; a custom `acceptSession` replaces the default, so it keeps the impersonation rule and adds its own.

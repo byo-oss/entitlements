@@ -168,7 +168,7 @@ async function updateSnapshot(
   rt.cache.delete(organizationId);
   if (!row) return { row: null, generation: null };
   const generation = rt.cache.generation(organizationId);
-  await notifyPlanChange(rt, organizationId, previous, row);
+  await notifyPlanChange(rt, organizationId, previous, row, adapter);
   return { row, generation };
 }
 
@@ -271,7 +271,7 @@ async function createSnapshot(
   }
   rt.cache.delete(organizationId);
   const generation = rt.cache.generation(organizationId);
-  await notifyPlanChange(rt, organizationId, null, row);
+  await notifyPlanChange(rt, organizationId, null, row, adapter);
   return { row, generation };
 }
 
@@ -280,14 +280,17 @@ async function createSnapshot(
  * (`isEntitled` + aliases + `defaultPlan`; overrides not included) differs
  * between `before` and `after`. A missing `before`, or one written by
  * another source (which resolution treats as missing), resolves to
- * `defaultPlan`. Shared by `writeSnapshot` and the sweep (N07). Never
- * throws: a throwing `isEntitled` is logged and nothing is emitted.
+ * `defaultPlan`. Shared by `writeSnapshot` and the sweep (N07). `adapter`
+ * is the one the write used: inside a caller's transaction the event fires
+ * after it commits (`emit`). Never throws: a throwing `isEntitled` is logged
+ * and nothing is emitted.
  */
 export async function notifyPlanChange(
   rt: EntitlementsRuntime,
   organizationId: string,
   before: EntitlementSnapshotRow | null,
   after: EntitlementSnapshotRow,
+  adapter?: DBTransactionAdapter,
 ): Promise<void> {
   const now = rt.now();
   let from: string;
@@ -315,5 +318,6 @@ export async function notifyPlanChange(
       data: { from, to, status: after.status ?? null },
       occurredAt: now,
     }),
+    adapter,
   );
 }

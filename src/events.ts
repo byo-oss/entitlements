@@ -1,4 +1,6 @@
+import { queueAfterTransactionHook } from "@better-auth/core/context";
 import type { ByoEvent, ByoEventHandler } from "@byo-oss/core";
+import { getCurrentAdapter } from "better-auth";
 import type { LimitValue } from "./catalog";
 import type { OverrideKind } from "./schema";
 
@@ -98,22 +100,34 @@ export type EmitLogger = {
 };
 
 /**
- * Hands an event to `onEvent`. Awaits the handler, catches and logs anything
- * it throws, and never throws itself, so a consumer can't fail the call that
- * caused the event.
+ * Hands an event to `onEvent`, after the write that caused it commits.
+ *
+ * - `adapter` is the adapter the write used; without it, the runtime's
+ *   current adapter (`getCurrentAdapter(context.adapter)`).
+ * - A write made through the base adapter (`context.adapter`) is durable when
+ *   it returns, so the handler runs now, awaited. So does every write on an
+ *   adapter without real transactions, and a call without a context.
+ * - A write that joined a caller's transaction (`runWithTransaction`) queues
+ *   the handler with `queueAfterTransactionHook`: it runs once the
+ *   transaction commits and is dropped if it rolls back.
+ *
+ * Never throws or rejects: the handler's error is caught and logged inside
+ * the queued hook (an uncaught one would rethrow after the commit), `onError`
+ * is passed as well, and a broken logger is ignored. The event is built
+ * before queueing, so `occurredAt` is the time of the write.
  */
 export async function emit(
   target: {
     options: { onEvent: ByoEventHandler | null };
     logger: EmitLogger;
+    context?: { adapter: unknown } | null;
   },
   event: EntitlementsEvent,
+  adapter?: unknown,
 ): Promise<void> {
   const handler = target.options.onEvent;
   if (!handler) return;
-  try {
-    await handler(event as unknown as ByoEvent);
-  } catch (error) {
+  const report = (error: unknown) => {
     try {
       target.logger.error(
         `[@byo-oss/entitlements] onEvent failed for ${event.type}`,
@@ -122,5 +136,28 @@ export async function emit(
     } catch {
       // a broken logger must not fail the call either
     }
+  };
+  const run = async () => {
+    try {
+      await handler(event as unknown as ByoEvent);
+    } catch (error) {
+      report(error);
+    }
+  };
+  try {
+    const base = target.context?.adapter;
+    if (base === undefined) return await run();
+    const used =
+      adapter ??
+      (await getCurrentAdapter(
+        base as Parameters<typeof getCurrentAdapter>[0],
+      ));
+    if (used === base) await run();
+    else
+      await queueAfterTransactionHook(run, {
+        onError: async (error) => report(error),
+      });
+  } catch (error) {
+    report(error);
   }
 }

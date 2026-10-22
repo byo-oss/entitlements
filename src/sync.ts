@@ -107,8 +107,8 @@ function take<T>(budget: Budget, rows: T[]): T[] {
  * (PRD A4): every read and write, and `source.resolve`, goes through
  * `currentAdapter(rt)`, so its writes commit or roll back with the caller.
  * It only updates and deletes existing rows, so no create conflict can
- * abort the caller, and it schedules no background work. Events are
- * emitted when the adapter write returns, before the caller commits.
+ * abort the caller, and it schedules no background work. Its
+ * `plan.changed` events fire after the caller commits, never on a rollback.
  */
 export async function runSync(
   rt: EntitlementsRuntime,

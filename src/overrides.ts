@@ -144,7 +144,8 @@ export function validateOverride(
  * `(organizationId, kind, key)` — then creates the new row (`status:
  * "active"`, `permanent = expiresAt === null`, `createdBy` = actor). Clears
  * the cache entry and emits `entitlements.override.set` (actor = the staff
- * user). Joins the caller's transaction.
+ * user). Joins the caller's transaction; the event then fires after it
+ * commits, never on a rollback.
  */
 export async function setOverride(
   rt: EntitlementsRuntime,
@@ -211,6 +212,7 @@ export async function setOverride(
       },
       occurredAt: rt.now(),
     }),
+    adapter,
   );
   return created;
 }
@@ -220,7 +222,7 @@ export async function setOverride(
  * `endedAt` = now; clears the cache entry; emits
  * `entitlements.override.removed`. Not found or not active → 404
  * `OVERRIDE_NOT_FOUND`. Returns the updated row. Joins the caller's
- * transaction.
+ * transaction; the event then fires after it commits.
  */
 export async function removeOverride(
   rt: EntitlementsRuntime,
@@ -256,6 +258,7 @@ export async function removeOverride(
       data: { kind: row.kind, key: row.key },
       occurredAt: rt.now(),
     }),
+    adapter,
   );
   return updated;
 }

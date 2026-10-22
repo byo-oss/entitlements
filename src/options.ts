@@ -140,7 +140,10 @@ export type EntitlementsOptions<C extends AnyCatalog = AnyCatalog> = {
   authorize?: EntitlementsAuthorize;
   /** Default: refuse impersonated sessions on staff calls and on every POST. */
   acceptSession?: EntitlementsAcceptSession;
-  /** Receives every event. Errors are logged and never fail the call. */
+  /**
+   * Receives every event; for a write inside a transaction, after it
+   * commits. Errors are logged and never fail the call.
+   */
   onEvent?: ByoEventHandler;
   /**
    * What `hasFeature`, `consumeUsage` and `checkCapacity` answer when the

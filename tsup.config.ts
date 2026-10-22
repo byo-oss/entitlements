@@ -5,6 +5,7 @@ const external = [
   "better-auth",
   "better-call",
   "zod",
+  "@better-auth/core",
   "@byo-oss/core",
   "@better-auth/stripe",
   "stripe",
