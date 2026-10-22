@@ -266,8 +266,8 @@ Only the first carries the `UNKNOWN_KEY` code; the other two are plain `Error`s 
 Result rules:
 
 - A limit of 0 means "not included": `getLimit`, `consumeUsage` and `checkCapacity` all answer `reason: "not_in_plan"`. A metered refusal still counts toward `refused`, and the first one in a period emits `limit_reached`.
-- `upgradeTo` never names the organization's current plan, only plans that would unlock the feature or limit.
-- Results are read-only (frozen). Copy one before changing it.
+- `upgradeTo` lists only plans strictly better on that key than the organization's current plan; it never names the current plan or a cheaper one.
+- Cached results are read-only and the public result types are `Readonly`; copy one before changing it. Check results and the degraded or unknown-organization results are plain fresh objects, and a `Date` in a result is a fresh copy on every call.
 
 ```ts
 // lib/guard.ts (server only)
@@ -479,7 +479,7 @@ The three tables are a public contract. They reference `organization` with `onDe
 | `seats` | number? | paid quantity, when the provider has one |
 | `pastDueSince` | date? | when this snapshot first saw `past_due`; null otherwise (the grace clock) |
 | `sourceRef` | string? | for example the Stripe subscription id |
-| `version` | number | default 0; every state write increments it |
+| `version` | number | default 0; every state write and every sweep claim increments it; a writer whose read is outdated loses and retries |
 | `syncedAt` | date | last successful resolve |
 | `nextSyncAt` | date, indexed | when the sweep should resync |
 | `syncState` | `"idle"` \| `"syncing"` | default `"idle"`; the sweep's claim |
@@ -606,7 +606,7 @@ export async function purgeOrganization(organizationId: string): Promise<void> {
 - **Syncs** write absolute state, so a repeat is harmless.
 - **`consumeUsage`** counts exactly once per call that returns `allowed`, and refusals never count. A caller that retries a call it believes failed can count twice; v0 has no idempotency key.
 - **Events** are best-effort and at most once, in-process. An `onEvent` that throws is logged and never fails the call.
-- **Sweeps** are at-least-once. Each row is claimed atomically with a lease, but a lease that expires (`leaseMs`) while a slow sweep is still working lets a second sweep claim the same row, and both resync it. That duplicate is harmless: a resync writes absolute state.
+- **Sweeps** are at-least-once. Each row is claimed atomically with a lease, but a lease that expires (`leaseMs`) while a slow sweep is still working lets a second sweep claim the same row. The first sweep's write then loses and only the second one's lands, so the row is resynced once; a resync writes absolute state, so nothing is lost.
 - **Lifecycle cleanup** failures are logged without failing the response; run `deleteOrganizationData` to retry.
 
 ## Outgrowing this

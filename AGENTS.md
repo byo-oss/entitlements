@@ -16,7 +16,7 @@ Optional: render `useEntitlements`, `EntitlementGate` and `UsageMeter` from `@by
 
 ## Rules
 
-- Gate with `createEntitlements` (`hasFeature`, `getLimit`, `consumeUsage`, `checkCapacity`), never by reading the plugin's tables or comparing plan names. Checks return `{ allowed, reason, upgradeTo }`; build the refusal from that. A limit of 0 answers `not_in_plan` everywhere, `upgradeTo` never names the current plan, and results are frozen.
+- Gate with `createEntitlements` (`hasFeature`, `getLimit`, `consumeUsage`, `checkCapacity`), never by reading the plugin's tables or comparing plan names. Checks return `{ allowed, reason, upgradeTo }`; build the refusal from that. A limit of 0 answers `not_in_plan` everywhere, `upgradeTo` lists only plans strictly better on that key than the current plan, and cached results are read-only (the result types are `Readonly`; check results are plain fresh objects).
 - `consumeUsage`, `sync(orgId)` and `refreshEntitlements` throw inside a transaction. Call them before or after it. Reads and `checkCapacity` work inside one, and the sweep (`processEntitlementsSync`, `byo.sweep`) joins it. Events fire when the adapter write returns, so inside a transaction one can announce a write that rolls back.
 - Every duration option is in milliseconds except `pastDueGraceDays`. `maxAge` must be at least 60000; `usageRetention` and `overrideRetention` at least 86400000.
 - Never rename a plan key that has subscribers; add a `planAliases` entry. Prices live in Stripe, not the catalog.
