@@ -12,7 +12,7 @@ export type EntitlementGateResult<C extends AnyCatalog = AnyCatalog> = {
   allowed: false;
   key: FeatureKey<C>;
   isLoading: boolean;
-  /** Plans that include the feature, in catalog order. */
+  /** Plans that include the feature, in catalog order, without the plan the organization is already on. */
   upgradeTo: PlanKey<C>[];
 };
 
@@ -37,10 +37,13 @@ export function EntitlementGate<C extends AnyCatalog = AnyCatalog>(
   const { entitlements, feature, catalog, children, fallback } = props;
   if (entitlements.hasFeature(feature)) return children ?? null;
   if (!fallback) return null;
+  const currentPlan = entitlements.data?.plan.key;
   return fallback({
     allowed: false,
     key: feature,
     isLoading: entitlements.isLoading,
-    upgradeTo: catalog ? upgradeTo(catalog, { feature }) : [],
+    upgradeTo: catalog
+      ? upgradeTo(catalog, { feature }).filter((plan) => plan !== currentPlan)
+      : [],
   });
 }

@@ -1,7 +1,7 @@
 // @vitest-environment happy-dom
 import { cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { defineEntitlements } from "../catalog";
+import { defineEntitlements, upgradeTo } from "../catalog";
 import {
   EntitlementGate,
   type EntitlementGateResult,
@@ -34,9 +34,12 @@ type Catalog = typeof catalog;
 function entitlements(
   features: Partial<Record<"exports" | "sso", boolean>>,
   isLoading = false,
+  planKey?: "free" | "pro" | "team",
 ): UseEntitlementsResult<Catalog> {
   return {
-    data: null,
+    data: planKey
+      ? ({ plan: { key: planKey } } as UseEntitlementsResult<Catalog>["data"])
+      : null,
     isLoading,
     error: null,
     hasFeature: (key) => features[key] === true,
@@ -84,6 +87,20 @@ describe("EntitlementGate", () => {
       upgradeTo: ["pro", "team"],
     });
     expect(container.innerHTML).toBe("<b>upgrade to pro or team</b>");
+  });
+
+  it("leaves the organization's current plan out of upgradeTo", () => {
+    const fallback = vi.fn((_result: EntitlementGateResult<Catalog>) => null);
+    render(
+      <EntitlementGate
+        entitlements={entitlements({}, false, "pro")}
+        feature="exports"
+        catalog={catalog}
+        fallback={fallback}
+      />,
+    );
+    expect(upgradeTo(catalog, { feature: "exports" })).toContain("pro");
+    expect(fallback.mock.calls[0]?.[0].upgradeTo).toEqual(["team"]);
   });
 
   it("gives an empty upgradeTo without a catalog", () => {
