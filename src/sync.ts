@@ -40,18 +40,50 @@ type Counts = Omit<EntitlementsSweepResult, "hasMore">;
 type Outcome = "synced" | "skipped" | "retrying" | "failed";
 
 /**
+ * The one `batchSize` budget of a sweep call (PRD A5(d), SPEC 5.3): every
+ * step takes rows from what is left, in step order, and `hasMore` records
+ * that a step found more rows than it could take.
+ */
+type Budget = { left: number; hasMore: boolean };
+
+/**
+ * A step's share of the budget: it reads `budget.left + 1` rows (a 1-row
+ * probe when nothing is left, so `hasMore` stays exact), takes at most
+ * `budget.left` of them and charges them to the budget.
+ */
+function take<T>(budget: Budget, rows: T[]): T[] {
+  const taken = rows.slice(0, budget.left);
+  if (rows.length > taken.length) budget.hasMore = true;
+  budget.left -= taken.length;
+  return taken;
+}
+
+/**
  * One sweep batch (PRD Background work):
  * 1. Release stale claims: a snapshot with `syncState = "syncing"` whose
  *    `syncClaimedAt` is at least `leaseMs` old goes back to `idle` (a dead
  *    worker). It is still due, so step 2 can claim it.
- * 2. Claim up to `batchSize` due idle snapshots, oldest `nextSyncAt` first,
- *    each with an `incrementOne` guarded on `id`, `syncState: "idle"` and
- *    `nextSyncAt lte now`. A lost claim counts as `skipped`.
+ * 2. Claim due idle snapshots, oldest `nextSyncAt` first, each with an
+ *    `incrementOne` guarded on `id`, `syncState: "idle"` and
+ *    `nextSyncAt lte now` that also increments `version`. A lost claim
+ *    counts as `skipped`.
  * 3. `source.resolve`, then `writeSnapshot`'s update guarded on the claimed
- *    `version` (`toSnapshotFields`, `plan.changed` through
- *    `notifyPlanChange`), then the organization's cache entry is cleared. A
- *    lost version guard means a push wrote newer state meanwhile: the claim
- *    is released and the row counts as `synced`.
+ *    (already incremented) `version` (`toSnapshotFields`, `plan.changed`
+ *    through `notifyPlanChange`), then the organization's cache entry is
+ *    cleared. A lost version guard means a push, a refresh or another sweep
+ *    wrote or claimed the row meanwhile: the claim is released and the row
+ *    counts as `synced`.
+ *
+ *    Why the claim moves `version`: every state write is guarded on the
+ *    version its writer read before calling `source.resolve`, so a write
+ *    lands only when nothing wrote or claimed the row since that read, and
+ *    the stored state was always resolved after the one it replaces. A push
+ *    or refresh (`syncOrganization`) that read the row before a claim loses
+ *    its write and retries with a fresh read and resolve (up to 3
+ *    retries), instead of storing a state older than the sweep's; the
+ *    sweep's own write loses to any push or refresh that wrote after its
+ *    claim, and to a second sweep that claimed the row after its lease ran
+ *    out.
  * 4. A throw backs off exponentially (`retrying`). Once `syncAttempts`
  *    reaches `maxAttempts` the row counts as `failed`: it keeps its last
  *    good state, records `syncError` and is retried at
@@ -59,9 +91,14 @@ type Outcome = "synced" | "skipped" | "retrying" | "failed";
  * 5. Marks live overrides past `expiresAt` as `expired`
  *    (`endedAt = expiresAt`); deletes usage counters whose period ended
  *    before `now - usageRetention` and removed or expired overrides that
- *    ended before `now - overrideRetention` (`pruned`). Each step reads at
- *    most `batchSize` rows.
- * 6. `hasMore` is true when any step found more than `batchSize` rows.
+ *    ended before `now - overrideRetention` (`pruned`).
+ * 6. `hasMore` is true when any step found more rows than the budget left
+ *    it.
+ *
+ * `batchSize` is one budget per call (PRD A5(d)): the claim steps (1 and 2)
+ * take from it first, then expiry and the two prunes take what is left, in
+ * that order. Every row a step takes counts, a released or lost claim
+ * included, so one call touches at most `batchSize` rows.
  *
  * Steps 1–4 are skipped without a source.
  *
@@ -85,16 +122,16 @@ export async function runSync(
     expired: 0,
     pruned: 0,
   };
-  let hasMore = false;
+  const budget: Budget = { left: rt.options.batchSize, hasMore: false };
   const { source } = rt.options;
   if (source) {
-    await releaseStaleClaims(rt, adapter, now);
-    if (await syncDue(rt, source, adapter, now, counts)) hasMore = true;
+    await releaseStaleClaims(rt, adapter, now, budget);
+    await syncDue(rt, source, adapter, now, counts, budget);
   }
-  if (await expireOverrides(rt, adapter, now, counts)) hasMore = true;
-  if (await pruneUsage(rt, adapter, now, counts)) hasMore = true;
-  if (await pruneOverrides(rt, adapter, now, counts)) hasMore = true;
-  return { ...counts, hasMore };
+  await expireOverrides(rt, adapter, now, counts, budget);
+  await pruneUsage(rt, adapter, now, counts, budget);
+  await pruneOverrides(rt, adapter, now, counts, budget);
+  return { ...counts, hasMore: budget.hasMore };
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +143,7 @@ async function releaseStaleClaims(
   rt: EntitlementsRuntime,
   adapter: DBTransactionAdapter,
   now: Date,
+  budget: Budget,
 ): Promise<void> {
   const cutoff = new Date(now.getTime() - rt.options.leaseMs);
   const stale: Where[] = [
@@ -115,10 +153,10 @@ async function releaseStaleClaims(
   const rows = await adapter.findMany<EntitlementSnapshotRow>({
     model: SNAPSHOT,
     where: stale,
-    limit: rt.options.batchSize,
+    limit: budget.left + 1,
     sortBy: { field: "syncClaimedAt", direction: "asc" },
   });
-  for (const row of rows) {
+  for (const row of take(budget, rows)) {
     await adapter.incrementOne<EntitlementSnapshotRow>({
       model: SNAPSHOT,
       where: [{ field: "id", value: row.id }, ...stale],
@@ -128,25 +166,25 @@ async function releaseStaleClaims(
   }
 }
 
-/** Steps 2–4. Returns whether more rows were due than `batchSize`. */
+/** Steps 2–4, with what the budget has left. */
 async function syncDue(
   rt: EntitlementsRuntime,
   source: BillingSource,
   adapter: DBTransactionAdapter,
   now: Date,
   counts: Counts,
-): Promise<boolean> {
-  const { batchSize } = rt.options;
+  budget: Budget,
+): Promise<void> {
   const due = await adapter.findMany<EntitlementSnapshotRow>({
     model: SNAPSHOT,
     where: [
       { field: "syncState", value: "idle" },
       { field: "nextSyncAt", operator: "lte", value: now },
     ],
-    limit: batchSize + 1,
+    limit: budget.left + 1,
     sortBy: { field: "nextSyncAt", direction: "asc" },
   });
-  const batch = due.slice(0, batchSize);
+  const batch = take(budget, due);
   for (let i = 0; i < batch.length; i += CONCURRENCY) {
     const outcomes = await Promise.all(
       batch
@@ -155,7 +193,6 @@ async function syncDue(
     );
     for (const outcome of outcomes) counts[outcome] += 1;
   }
-  return due.length > batchSize;
 }
 
 async function syncOne(
@@ -167,7 +204,9 @@ async function syncOne(
 ): Promise<Outcome> {
   // incrementOne is the adapter's compare-and-swap: of several sweeps that
   // listed this row, exactly one gets it back. The "due" guard keeps a
-  // sweep from re-claiming a row another sweep already finished.
+  // sweep from re-claiming a row another sweep already finished. The claim
+  // moves `version`, so a push or refresh that read the row before it
+  // loses its write and resolves again (see runSync).
   const claimed = await adapter.incrementOne<EntitlementSnapshotRow>({
     model: SNAPSHOT,
     where: [
@@ -175,7 +214,7 @@ async function syncOne(
       { field: "syncState", value: "idle" },
       { field: "nextSyncAt", operator: "lte", value: now },
     ],
-    increment: { syncAttempts: 1 },
+    increment: { syncAttempts: 1, version: 1 },
     set: { syncState: "syncing", syncClaimedAt: now },
   });
   if (!claimed) return "skipped";
@@ -263,14 +302,14 @@ async function retryOrFail(
 // Step 5: overrides and usage
 // ---------------------------------------------------------------------------
 
-/** Marks live overrides past `expiresAt` as `expired`. Returns whether more were found than `batchSize`. */
+/** Marks live overrides past `expiresAt` as `expired`, with what the budget has left. */
 async function expireOverrides(
   rt: EntitlementsRuntime,
   adapter: DBTransactionAdapter,
   now: Date,
   counts: Counts,
-): Promise<boolean> {
-  const { batchSize } = rt.options;
+  budget: Budget,
+): Promise<void> {
   const rows = await adapter.findMany<EntitlementOverrideRow>({
     model: OVERRIDE,
     where: [
@@ -278,10 +317,10 @@ async function expireOverrides(
       { field: "permanent", value: false },
       { field: "expiresAt", operator: "lte", value: now },
     ],
-    limit: batchSize + 1,
+    limit: budget.left + 1,
     sortBy: { field: "expiresAt", direction: "asc" },
   });
-  for (const row of rows.slice(0, batchSize)) {
+  for (const row of take(budget, rows)) {
     const updated = await adapter.incrementOne<EntitlementOverrideRow>({
       model: OVERRIDE,
       where: [
@@ -296,38 +335,38 @@ async function expireOverrides(
       rt.cache.delete(row.organizationId);
     }
   }
-  return rows.length > batchSize;
 }
 
-/** Deletes usage counters whose period ended before `now - usageRetention`. */
+/** Deletes usage counters whose period ended before `now - usageRetention`, with what the budget has left. */
 async function pruneUsage(
   rt: EntitlementsRuntime,
   adapter: DBTransactionAdapter,
   now: Date,
   counts: Counts,
-): Promise<boolean> {
-  const { batchSize, usageRetention } = rt.options;
+  budget: Budget,
+): Promise<void> {
+  const { usageRetention } = rt.options;
   const cutoff = new Date(now.getTime() - usageRetention);
   const rows = await adapter.findMany<EntitlementUsageRow>({
     model: USAGE,
     where: [{ field: "periodEnd", operator: "lt", value: cutoff }],
-    limit: batchSize + 1,
+    limit: budget.left + 1,
     sortBy: { field: "periodEnd", direction: "asc" },
   });
-  const ids = rows.slice(0, batchSize).map((row) => row.id);
+  const ids = take(budget, rows).map((row) => row.id);
   await deleteByIds(adapter, USAGE, ids, []);
   counts.pruned += ids.length;
-  return rows.length > batchSize;
 }
 
-/** Deletes removed or expired overrides that ended before `now - overrideRetention`. */
+/** Deletes removed or expired overrides that ended before `now - overrideRetention`, with what the budget has left. */
 async function pruneOverrides(
   rt: EntitlementsRuntime,
   adapter: DBTransactionAdapter,
   now: Date,
   counts: Counts,
-): Promise<boolean> {
-  const { batchSize, overrideRetention } = rt.options;
+  budget: Budget,
+): Promise<void> {
+  const { overrideRetention } = rt.options;
   const cutoff = new Date(now.getTime() - overrideRetention);
   const ended: Where = {
     field: "status",
@@ -337,14 +376,13 @@ async function pruneOverrides(
   const rows = await adapter.findMany<EntitlementOverrideRow>({
     model: OVERRIDE,
     where: [ended, { field: "endedAt", operator: "lt", value: cutoff }],
-    limit: batchSize + 1,
+    limit: budget.left + 1,
     sortBy: { field: "endedAt", direction: "asc" },
   });
-  const ids = rows.slice(0, batchSize).map((row) => row.id);
+  const ids = take(budget, rows).map((row) => row.id);
   // the status guard is repeated, so an active override is never deleted
   await deleteByIds(adapter, OVERRIDE, ids, [ended]);
   counts.pruned += ids.length;
-  return rows.length > batchSize;
 }
 
 /** `deleteMany` by id, in chunks of 90; no query for an empty list. */

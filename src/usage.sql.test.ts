@@ -5,6 +5,7 @@ import { bucketKey } from "./period";
 import { createSqlTestAuth, type SqlTestAuthConfig } from "./test-sql";
 import {
   type AdapterCall,
+  fakeSource,
   getRuntime,
   seedOrg,
   seedUsage,
@@ -132,17 +133,28 @@ describe("consumeUsage on SQL", () => {
 
   it("refusals don't count, a 0 limit refuses and signals once, a new day starts a new bucket", async () => {
     const t = await setup({ apiCalls: 0, uploads: 2 });
+    // a 0 limit means "not included" (PRD A5(c))
     expect(
       await t.api.consumeUsage(t.organizationId, "apiCalls"),
-    ).toMatchObject({ allowed: false, firstRefusal: true, used: 0 });
+    ).toMatchObject({
+      allowed: false,
+      reason: "not_in_plan",
+      firstRefusal: true,
+      used: 0,
+    });
     expect(
       await t.api.consumeUsage(t.organizationId, "apiCalls"),
-    ).toMatchObject({ allowed: false, firstRefusal: false, used: 0 });
+    ).toMatchObject({
+      allowed: false,
+      reason: "not_in_plan",
+      firstRefusal: false,
+      used: 0,
+    });
     expect(limitEvents(t.onEvent)).toHaveLength(1);
 
     await t.api.consumeUsage(t.organizationId, "uploads", { amount: 2 });
     expect(await t.api.consumeUsage(t.organizationId, "uploads")).toMatchObject(
-      { allowed: false, used: 2, firstRefusal: true },
+      { allowed: false, reason: "limit_reached", used: 2, firstRefusal: true },
     );
 
     t.setNow(new Date("2026-03-11T00:00:00.000Z"));
@@ -195,4 +207,71 @@ describe("consumeUsage on SQL", () => {
       remaining: 6,
     });
   });
+});
+
+describe("an id that isn't an organization, on SQL (RC review 1 #5)", () => {
+  for (const withSource of [false, true]) {
+    it(`consumeUsage refuses with not_in_plan and writes nothing; the reads answer defaultPlan (${withSource ? "with" : "without"} a source)`, async () => {
+      const source = fakeSource();
+      const t = await setup(
+        { apiCalls: 10 },
+        {
+          options: {
+            ...(withSource ? { source } : {}),
+            // the cache on, so a cached state can't carry a bucket write
+            cacheTtlMs: 30_000,
+          },
+        },
+      );
+      const ghost = "org_does_not_exist";
+      // fill the cache path first through getMany, then consume
+      expect((await t.api.getMany([ghost]))[0]).toMatchObject({
+        organizationId: ghost,
+        degraded: false,
+        plan: { key: "free" },
+      });
+      for (let i = 0; i < 2; i++) {
+        expect(await t.api.consumeUsage(ghost, "apiCalls")).toMatchObject({
+          allowed: false,
+          reason: "not_in_plan",
+          upgradeTo: [],
+          used: 0,
+          firstRefusal: false,
+        });
+      }
+      expect(await t.api.hasFeature(ghost, "exports")).toMatchObject({
+        allowed: false,
+        reason: "not_in_plan",
+        plan: "free",
+      });
+      expect(await t.api.getLimit(ghost, "members")).toMatchObject({
+        allowed: true,
+        plan: "free",
+        limit: 5,
+        degraded: false,
+      });
+      expect(
+        await t.api.checkCapacity(ghost, "members", { count: 1 }),
+      ).toMatchObject({ allowed: true, plan: "free" });
+      const usage = await t.db
+        .selectFrom("entitlementUsage")
+        .selectAll()
+        .execute();
+      expect(usage).toHaveLength(0);
+      const snapshots = await t.db
+        .selectFrom("entitlementSnapshot")
+        .selectAll()
+        .execute();
+      expect(snapshots).toHaveLength(0);
+      expect(limitEvents(t.onEvent)).toHaveLength(0);
+      expect(t.onEvent).not.toHaveBeenCalled();
+      expect(t.error).not.toHaveBeenCalled();
+      expect(source.calls).toHaveLength(0);
+      // a real organization still gets its bucket
+      expect(
+        await t.api.consumeUsage(t.organizationId, "apiCalls"),
+      ).toMatchObject({ allowed: true, used: 1 });
+      expect(await t.rows()).toHaveLength(1);
+    });
+  }
 });

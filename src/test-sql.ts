@@ -36,6 +36,13 @@ export type SqlTestAuthConfig<
   transaction?: boolean;
   /** better-auth's `advanced.database.generateId`. @default better-auth's own ids */
   generateId?: "uuid" | "serial";
+  /**
+   * Another harness's database: this auth runs on the same PGlite and
+   * Kysely (no new database, no migration), as a second process would.
+   * Its `close()` leaves the shared database open.
+   */
+  // biome-ignore lint/suspicious/noExplicitAny: as `db` below
+  shareWith?: { db: Kysely<any>; pglite: PGlite };
 };
 
 /**
@@ -48,9 +55,12 @@ export type SqlTestAuthConfig<
 export async function createSqlTestAuth<P extends BetterAuthPlugin[] = []>(
   config: SqlTestAuthConfig<P> = {},
 ) {
-  const pglite = new PGlite();
-  // biome-ignore lint/suspicious/noExplicitAny: tables come from the migration, not a typed schema
-  const db = new Kysely<any>({ dialect: new KyselyPGlite(pglite).dialect });
+  const shared = config.shareWith;
+  const pglite = shared?.pglite ?? new PGlite();
+  const db =
+    shared?.db ??
+    // biome-ignore lint/suspicious/noExplicitAny: tables come from the migration, not a typed schema
+    new Kysely<any>({ dialect: new KyselyPGlite(pglite).dialect });
   const advanced: BetterAuthOptions["advanced"] = {
     ...config.authOptions?.advanced,
     ...(config.generateId
@@ -69,11 +79,13 @@ export async function createSqlTestAuth<P extends BetterAuthPlugin[] = []>(
   };
   // getMigrations needs the object form of `database`; the auth below uses
   // a wrapped adapter factory on the same Kysely instance
-  const { runMigrations } = await getMigrations({
-    ...options,
-    database: { db, type: "postgres" },
-  });
-  await runMigrations();
+  if (!shared) {
+    const { runMigrations } = await getMigrations({
+      ...options,
+      database: { db, type: "postgres" },
+    });
+    await runMigrations();
+  }
   const auth = betterAuth({
     ...options,
     database: wrapAdapterFactory(
@@ -90,7 +102,7 @@ export async function createSqlTestAuth<P extends BetterAuthPlugin[] = []>(
     db,
     pglite,
     close: async () => {
-      await db.destroy();
+      if (!shared) await db.destroy();
     },
   };
 }

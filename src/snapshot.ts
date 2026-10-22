@@ -162,11 +162,16 @@ async function updateSnapshot(
 }
 
 /**
- * Writes a resolved state for an organization (read-through, push, `sync`).
+ * Writes a resolved state for an organization (read-through, push, `sync`,
+ * the sweep).
  * - Creates the row when `previous` is null, through `singleFlight` keyed by
- *   organization (`snapshot:<id>`). The flight re-reads first and updates a
- *   row that appeared meanwhile; on a create error it re-reads and rethrows
- *   only if the row is still missing (else it updates that row).
+ *   organization (`snapshot:<id>`). A row another writer created after the
+ *   caller's read is never overwritten: the flight re-reads first and
+ *   returns null when the row exists; on a create error it re-reads and
+ *   rethrows only if the row is still missing (else null); a caller that
+ *   joined another caller's flight gets null too (the row holds that
+ *   caller's state, not its own). Callers re-read (read-through) or retry
+ *   read→resolve→write (`syncOrganization`).
  * - Otherwise updates in place, guarded on `previous.version`, incrementing
  *   `version`; also when `previous.source` differs from the configured one.
  * - Sets `syncedAt = now`, `nextSyncAt = now + maxAge`, `syncState: "idle"`,
@@ -174,7 +179,8 @@ async function updateSnapshot(
  * - Clears this process's cache entry, and emits `entitlements.plan.changed`
  *   (through `notifyPlanChange`) when the resolved plan key changed.
  * Returns the row as stored, or null when nothing was written (the version
- * guard lost to a newer write). Callers outside a transaction only.
+ * guard lost to a newer write or a sweep's claim, or the create found a row
+ * someone else wrote). Callers outside a transaction only.
  */
 export async function writeSnapshot(
   rt: EntitlementsRuntime,
@@ -189,40 +195,52 @@ export async function writeSnapshot(
   if (previous) {
     return updateSnapshot(rt, organizationId, state, previous, adapter);
   }
-  return singleFlight(rt, `snapshot:${organizationId}`, async () => {
-    const existing = await readSnapshot(rt, adapter, organizationId);
-    if (existing) {
-      return updateSnapshot(rt, organizationId, state, existing, adapter);
-    }
-    const now = rt.now();
-    let row: EntitlementSnapshotRow;
-    try {
-      row = await adapter.create<
-        Omit<EntitlementSnapshotRow, "id">,
-        EntitlementSnapshotRow
-      >({
-        model: MODEL,
-        data: {
-          organizationId,
-          ...toSnapshotFields(state, {
-            source: rt.options.sourceId,
-            previous: null,
-            now,
-          }),
-          version: 0,
-          ...syncFields(rt, now),
-          createdAt: now,
-        },
-      });
-    } catch (error) {
-      const raced = await readSnapshot(rt, adapter, organizationId);
-      if (!raced) throw error;
-      return updateSnapshot(rt, organizationId, state, raced, adapter);
-    }
-    rt.cache.delete(organizationId);
-    await notifyPlanChange(rt, organizationId, null, row);
-    return row;
+  let mine = false;
+  const created = await singleFlight(rt, `snapshot:${organizationId}`, () => {
+    mine = true;
+    return createSnapshot(rt, organizationId, state, adapter);
   });
+  return mine ? created : null;
+}
+
+/** The create flight of `writeSnapshot`: null when a row already exists. */
+async function createSnapshot(
+  rt: EntitlementsRuntime,
+  organizationId: string,
+  state: BillingState | null,
+  adapter: DBTransactionAdapter,
+): Promise<EntitlementSnapshotRow | null> {
+  // written by another caller after this one's read: its state may be
+  // newer than this one, so it stays
+  if (await readSnapshot(rt, adapter, organizationId)) return null;
+  const now = rt.now();
+  let row: EntitlementSnapshotRow;
+  try {
+    row = await adapter.create<
+      Omit<EntitlementSnapshotRow, "id">,
+      EntitlementSnapshotRow
+    >({
+      model: MODEL,
+      data: {
+        organizationId,
+        ...toSnapshotFields(state, {
+          source: rt.options.sourceId,
+          previous: null,
+          now,
+        }),
+        version: 0,
+        ...syncFields(rt, now),
+        createdAt: now,
+      },
+    });
+  } catch (error) {
+    // another process won the unique organizationId: its row stays
+    if (await readSnapshot(rt, adapter, organizationId)) return null;
+    throw error;
+  }
+  rt.cache.delete(organizationId);
+  await notifyPlanChange(rt, organizationId, null, row);
+  return row;
 }
 
 /**

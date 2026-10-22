@@ -11,6 +11,7 @@ import {
   getRuntime,
   makeAuth,
   seedOrg,
+  seedOverride,
   seedUsage,
   setSnapshot,
   testCatalog,
@@ -166,7 +167,9 @@ describe("consumeUsage: refusals, zero limits, periods (PRD #13)", () => {
       limit: 5,
       firstRefusal: true,
     });
-    expect(tooMuch.upgradeTo).toEqual(["free", "pro", "team"]);
+    // the hook lowered free's 1000 to 5, but free is the current plan: never
+    // listed (PRD A5(b))
+    expect(tooMuch.upgradeTo).toEqual(["pro", "team"]);
     // what is left still fits
     expect(
       await t.api.consumeUsage(t.organizationId, "apiCalls", { amount: 2 }),
@@ -193,19 +196,24 @@ describe("consumeUsage: refusals, zero limits, periods (PRD #13)", () => {
     expect(events[0].occurredAt).toEqual(NOW);
   });
 
-  it("a 0 limit refuses, creates the bucket, and signals once per period", async () => {
+  it("a 0 limit refuses as not_in_plan, creates the bucket, and signals once per period", async () => {
     const t = await setup({ limits: { apiCalls: 0 } });
     const first = await t.api.consumeUsage(t.organizationId, "apiCalls");
     expect(first).toMatchObject({
       allowed: false,
-      reason: "limit_reached",
+      // a 0 limit means "not included" (PRD A5(c))
+      reason: "not_in_plan",
       used: 0,
       limit: 0,
       remaining: 0,
       firstRefusal: true,
     });
     const second = await t.api.consumeUsage(t.organizationId, "apiCalls");
-    expect(second).toMatchObject({ allowed: false, firstRefusal: false });
+    expect(second).toMatchObject({
+      allowed: false,
+      reason: "not_in_plan",
+      firstRefusal: false,
+    });
     expect(await t.bucketRow("apiCalls", DAY_START)).toMatchObject({
       used: 0,
       refused: 2,
@@ -676,8 +684,8 @@ describe("getLimit", () => {
     });
     const used = await t.api.getLimit(t.organizationId, "apiCalls");
     expect(used).toMatchObject({ allowed: true, used: 7, remaining: 3 });
-    // upgradeTo: plans with at least used + 1
-    expect(used.upgradeTo).toEqual(["free", "pro", "team"]);
+    // upgradeTo: plans with at least used + 1, never the current one
+    expect(used.upgradeTo).toEqual(["pro", "team"]);
     expect(await t.bucketCount()).toBe(1);
   });
 
@@ -690,7 +698,7 @@ describe("getLimit", () => {
       reason: "limit_reached",
       remaining: 0,
     });
-    expect(reached.upgradeTo).toEqual(["free", "pro", "team"]);
+    expect(reached.upgradeTo).toEqual(["pro", "team"]);
     const capacity = await t.api.getLimit(t.organizationId, "members");
     expect(capacity).toMatchObject({
       allowed: false,
@@ -699,7 +707,7 @@ describe("getLimit", () => {
       degraded: false,
     });
     expect(capacity).not.toHaveProperty("used");
-    expect(capacity.upgradeTo).toEqual(["free", "pro", "team"]);
+    expect(capacity.upgradeTo).toEqual(["pro", "team"]);
     t.limits.apiCalls = 0;
     expect(await t.api.getLimit(t.organizationId, "apiCalls")).toMatchObject({
       allowed: false,
@@ -788,5 +796,155 @@ describe("readUsage", () => {
       ),
     ).toEqual({ used: 6, remaining: 0, resetAt: DAY_END });
     expect(await t.bucketCount()).toBe(1);
+  });
+});
+
+describe("upgradeTo never names the current plan (PRD A5(b))", () => {
+  it("a feature override that turns off a feature of the current plan: hasFeature lists only the other plans", async () => {
+    const source = fakeSource();
+    const auth = makeAuth({ options: { source, cacheTtlMs: 0 } });
+    const { organizationId } = await seedOrg(auth);
+    source.states.set(organizationId, { planKey: "pro", status: "active" });
+    await seedOverride(auth, {
+      organizationId,
+      kind: "feature",
+      key: "exports",
+      value: false,
+    });
+    const api = createEntitlements(auth, testCatalog);
+    const refused = await api.hasFeature(organizationId, "exports");
+    expect(refused).toMatchObject({
+      allowed: false,
+      reason: "not_in_plan",
+      plan: "pro",
+    });
+    // pro and team include exports in the catalog; pro is the current plan
+    expect(refused.upgradeTo).toEqual(["team"]);
+  });
+
+  it("a limit override below the plan's limit: consumeUsage and getLimit list only the other plans", async () => {
+    const source = fakeSource();
+    const auth = makeAuth({ options: { source, cacheTtlMs: 0 } });
+    const { organizationId } = await seedOrg(auth);
+    source.states.set(organizationId, { planKey: "pro", status: "active" });
+    await seedOverride(auth, {
+      organizationId,
+      kind: "limit",
+      key: "apiCalls",
+      value: 1,
+    });
+    const api = createEntitlements(auth, testCatalog);
+    const allowed = await api.consumeUsage(organizationId, "apiCalls");
+    expect(allowed).toMatchObject({ allowed: true, used: 1, plan: "pro" });
+    expect(allowed.upgradeTo).not.toContain("pro");
+    const refused = await api.consumeUsage(organizationId, "apiCalls", {
+      amount: 2_000,
+    });
+    expect(refused).toMatchObject({
+      allowed: false,
+      reason: "limit_reached",
+      plan: "pro",
+    });
+    // pro has 50000 apiCalls in the catalog (free 1000, team unlimited),
+    // but pro is the current plan
+    expect(refused.upgradeTo).toEqual(["team"]);
+    const limit = await api.getLimit(organizationId, "apiCalls");
+    expect(limit).toMatchObject({ allowed: false, reason: "limit_reached" });
+    expect(limit.upgradeTo).not.toContain("pro");
+  });
+});
+
+describe("an id that isn't an organization (RC review 1 #5, memory)", () => {
+  for (const withSource of [false, true]) {
+    it(`consumeUsage refuses with not_in_plan and writes nothing; hasFeature, getLimit and checkCapacity answer from defaultPlan (${withSource ? "with" : "without"} a source)`, async () => {
+      const source = fakeSource();
+      const onEvent = vi.fn();
+      const auth = makeAuth({
+        options: {
+          ...(withSource ? { source } : {}),
+          cacheTtlMs: 30_000,
+          onEvent,
+        },
+      });
+      const rt = await getRuntime(auth);
+      const error = vi.fn();
+      rt.logger = { ...rt.logger, error };
+      const context = await getContext(auth);
+      const api = createEntitlements(auth, testCatalog);
+      const ghost = "org_does_not_exist";
+
+      // getMany and get don't cache it, so consumeUsage sees known: false
+      expect((await api.getMany([ghost]))[0]?.plan.key).toBe("free");
+      expect((await api.get(ghost)).plan.key).toBe("free");
+      const state = await resolveModule.resolveState(rt, ghost);
+      expect(state.known).toBe(false);
+      for (let i = 0; i < 2; i++) {
+        expect(await api.consumeUsage(ghost, "apiCalls")).toEqual({
+          allowed: false,
+          reason: "not_in_plan",
+          key: "apiCalls",
+          plan: "free",
+          upgradeTo: [],
+          used: 0,
+          limit: 1_000,
+          remaining: 1_000,
+          resetAt: expect.any(Date),
+          firstRefusal: false,
+        });
+      }
+      expect(await api.hasFeature(ghost, "exports")).toMatchObject({
+        allowed: false,
+        reason: "not_in_plan",
+        plan: "free",
+      });
+      expect(await api.getLimit(ghost, "apiCalls")).toMatchObject({
+        allowed: true,
+        reason: "ok",
+        plan: "free",
+        limit: 1_000,
+        used: 0,
+        degraded: false,
+      });
+      expect(
+        await api.checkCapacity(ghost, "members", { count: 1 }),
+      ).toMatchObject({ allowed: true, plan: "free", limit: 5 });
+      expect(
+        await context.adapter.count({ model: "entitlementUsage", where: [] }),
+      ).toBe(0);
+      expect(
+        await context.adapter.count({
+          model: "entitlementSnapshot",
+          where: [],
+        }),
+      ).toBe(0);
+      expect(onEvent).not.toHaveBeenCalled();
+      expect(error).not.toHaveBeenCalled();
+      expect(source.calls).toHaveLength(0);
+    });
+  }
+
+  it("an organization deleted after its state was cached: the bucket create checks it and writes nothing", async () => {
+    const auth = makeAuth({ options: { cacheTtlMs: 30_000 } });
+    const rt = await getRuntime(auth);
+    const error = vi.fn();
+    rt.logger = { ...rt.logger, error };
+    const context = await getContext(auth);
+    const { organizationId } = await seedOrg(auth);
+    const api = createEntitlements(auth, testCatalog);
+    expect((await api.get(organizationId)).plan.key).toBe("free");
+    // gone without the cleanup hook: the cached state still says known
+    await context.adapter.delete({
+      model: "organization",
+      where: [{ field: "id", value: organizationId }],
+    });
+    expect(await api.consumeUsage(organizationId, "apiCalls")).toMatchObject({
+      allowed: false,
+      reason: "not_in_plan",
+      upgradeTo: [],
+    });
+    expect(
+      await context.adapter.count({ model: "entitlementUsage", where: [] }),
+    ).toBe(0);
+    expect(error).not.toHaveBeenCalled();
   });
 });

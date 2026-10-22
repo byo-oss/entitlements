@@ -1,5 +1,6 @@
 import type { DBTransactionAdapter } from "better-auth";
 import { findManyIn, findOrganization } from "./adapter";
+import { freezeState } from "./cache";
 import {
   canonicalPlanKey,
   isLimitValue,
@@ -13,6 +14,7 @@ import {
 } from "./live-overrides";
 import {
   type EntitlementsRuntime,
+  queuedFlight,
   requireContext,
   singleFlight,
 } from "./runtime";
@@ -55,6 +57,8 @@ type Loaded = {
   failure: Failure | null;
   /** Whether `failure` was already logged (a batch read in `resolveMany`). */
   logged: boolean;
+  /** False when the id isn't an organization. */
+  known: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -181,8 +185,14 @@ async function compute(
     overrides: applied,
   };
   return failure
-    ? { result, snapshot: null, entitled: false, error: failure.error }
-    : { result, snapshot, entitled };
+    ? {
+        result,
+        snapshot: null,
+        entitled: false,
+        known: true,
+        error: failure.error,
+      }
+    : { result, snapshot, entitled, known: loaded.known };
 }
 
 // ---------------------------------------------------------------------------
@@ -258,8 +268,14 @@ async function loadSnapshot(
   now: Date,
 ): Promise<SnapshotLoad> {
   const source = rt.options.source;
-  // without a source every organization is on defaultPlan: snapshots are ignored
-  if (!source) return { snapshot: null, known: true };
+  // without a source every organization is on defaultPlan: snapshots are
+  // ignored, and only whether the id is an organization is read
+  if (!source) {
+    return {
+      snapshot: null,
+      known: (await findOrganization(adapter, organizationId)) !== null,
+    };
+  }
   const snapshot = await readSnapshot(rt, adapter, organizationId);
   if (snapshot && snapshot.source === rt.options.sourceId) {
     return { snapshot, known: true };
@@ -335,17 +351,24 @@ async function refreshIfStale(
   }
 }
 
-/** Caches a state and handles staleness, outside a transaction only. */
+/**
+ * Caches a state and handles staleness, outside a transaction only. Returns
+ * the state to hand back: a cacheable one (not degraded, a known
+ * organization) as the deep-frozen copy the cache stores (`freezeState`),
+ * also when the cache is off, so every caller gets a read-only result.
+ */
 async function settle(
   rt: EntitlementsRuntime,
   adapter: DBTransactionAdapter | null,
   state: ResolvedState,
-  cacheable: boolean,
   now: Date,
-): Promise<void> {
-  if (state.result.degraded || !adapter) return;
+): Promise<ResolvedState> {
+  if (state.result.degraded || !adapter) return state;
   if (state.snapshot) await refreshIfStale(rt, adapter, state.snapshot, now);
-  if (cacheable) rt.cache.set(state.result.organizationId, state);
+  if (!state.known) return state;
+  const frozen = freezeState(state);
+  rt.cache.set(frozen.result.organizationId, frozen);
+  return frozen;
 }
 
 // ---------------------------------------------------------------------------
@@ -358,11 +381,13 @@ async function settle(
  * aliases, plan override, `resolveEntitlements`, feature/limit overrides,
  * background refresh when stale. `bypassCache` skips the cache read.
  *
- * Read-through for a missing snapshot first runs one `findOne` on
- * `organization` (`findOrganization`): an unknown organization id answers
- * `defaultPlan` (not degraded), persists nothing and isn't cached. Inside a
- * transaction it reads the cache but never fills it, persists nothing and
- * schedules no refresh.
+ * Read-through for a missing snapshot (and every uncached read without a
+ * source) first runs one `findOne` on `organization` (`findOrganization`):
+ * an unknown organization id answers `defaultPlan` (not degraded) with
+ * `known: false`, persists nothing and isn't cached. Inside a transaction
+ * it reads the cache but never fills it, persists nothing and schedules no
+ * refresh. Outside one, a cacheable state comes back deep-frozen (the copy
+ * the cache holds): results are read-only.
  *
  * Never throws for an outage: when the database, the source or the
  * `resolveEntitlements` hook throws, it answers `defaultPlan` with
@@ -405,11 +430,16 @@ export async function resolveState(
   const state = await compute(
     rt,
     organizationId,
-    { snapshot: load.snapshot, overrides, failure, logged: false },
+    {
+      snapshot: load.snapshot,
+      overrides,
+      failure,
+      logged: false,
+      known: load.known,
+    },
     now,
   );
-  if (!inTx) await settle(rt, adapter, state, load.known, now);
-  return state;
+  return inTx ? state : settle(rt, adapter, state, now);
 }
 
 /** `resolveState(...).result`: what `get` returns. */
@@ -425,7 +455,9 @@ export async function resolveEntitlements(
  * once each). Cache hits are used; the rest have their snapshots and
  * overrides read with the `in` rules (`findManyIn`); an organization whose
  * snapshot is missing or from another source goes through `resolveState`
- * (read-through). An empty list returns `[]` with no query; more than
+ * (read-through). Without a source the misses' `organization` rows are
+ * read the same way, so an id that isn't one comes back `known: false` and
+ * isn't cached. Cached results are deep-frozen (read-only). An empty list returns `[]` with no query; more than
  * `MAX_GET_MANY` ids throws
  * `[@byo-oss/entitlements] getMany takes at most 1000 organization ids`.
  * A failed batch read degrades every organization it covered and logs once;
@@ -454,6 +486,9 @@ export async function resolveMany(
     let inTx = true;
     let failure: Failure | null = null;
     const snapshots = new Map<string, EntitlementSnapshotRow>();
+    // without a source, the ids that are organizations (with one, an id
+    // without a snapshot goes through resolveState, which checks it)
+    let organizations: Set<string> | null = null;
     try {
       adapter = await currentAdapter(rt);
       inTx = await inTransaction(rt);
@@ -464,6 +499,14 @@ export async function resolveMany(
           values: misses,
         });
         for (const row of rows) snapshots.set(row.organizationId, row);
+      } else {
+        const rows = await findManyIn<{ id: string }>(adapter, {
+          model: "organization",
+          field: "id",
+          values: misses,
+          select: ["id"],
+        });
+        organizations = new Set(rows.map((row) => String(row.id)));
       }
     } catch (error) {
       failure = { error };
@@ -501,35 +544,68 @@ export async function resolveMany(
             overrides: overrideSets?.get(id) ?? null,
             failure,
             logged: true,
+            known: organizations?.has(id) ?? true,
           },
           now,
         );
-        if (!inTx) await settle(rt, adapter, state, true, now);
-        states.set(id, state);
+        states.set(id, inTx ? state : await settle(rt, adapter, state, now));
       }),
     );
   }
   return organizationIds.map((id) => (states.get(id) as ResolvedState).result);
 }
 
+/** Times `syncOrganization` retries a lost read→resolve→write before it gives up (4 attempts in all). */
+export const SYNC_WRITE_RETRIES = 3;
+
 /**
- * `sync`, `refreshEntitlements` and a source's `changed`: calls
- * `source.resolve` now, writes the snapshot (`writeSnapshot`), clears the
- * cache entry and returns fresh state (cache bypassed; that fresh state can
- * itself come back degraded). Throws when the source or the database throws
- * (nothing persisted), `[@byo-oss/entitlements] syncOrganization:
- * organization <id> not found` for an id that isn't an organization (nothing
- * written), and `[@byo-oss/entitlements] sync must run outside a
- * transaction` inside one. It doesn't log a failure: its caller does, once
- * (`sync` logs and rethrows, `refreshEntitlements` logs and answers 503,
- * the `changed` callback logs and rethrows to the source). Without a source
- * it writes nothing and resolves fresh.
+ * `sync`, `refreshEntitlements` and a source's `changed`: reads the
+ * snapshot, calls `source.resolve` now, writes the snapshot
+ * (`writeSnapshot`, guarded on the version it read), clears the cache entry
+ * and returns fresh state (cache bypassed; that fresh state can itself come
+ * back degraded).
+ *
+ * A lost write (`writeSnapshot` returned null: another push, refresh or
+ * sweep wrote or claimed the row after the read) means this state may be
+ * older than the winner's, so the whole read→resolve→write runs again, up
+ * to `SYNC_WRITE_RETRIES` (3) times (4 attempts in all). Every stored state was
+ * therefore resolved after the write (or claim) before it. When every
+ * attempt loses it throws `[@byo-oss/entitlements] syncOrganization: lost
+ * the snapshot write to concurrent writers`, so a webhook push answers an
+ * error (the provider redelivers) and `refreshEntitlements` answers 503.
+ *
+ * Within one process, calls for the same organization run one at a time
+ * (`queuedFlight("sync:<id>")`): a call made while one runs waits for it and
+ * shares the next run with the other waiting calls, so each caller's state
+ * was resolved after it called.
+ *
+ * Also throws when the source or the database throws (nothing persisted),
+ * `[@byo-oss/entitlements] syncOrganization: organization <id> not found`
+ * for an id that isn't an organization (nothing written), and
+ * `[@byo-oss/entitlements] sync must run outside a transaction` inside one.
+ * It doesn't log a failure: its caller does, once (`sync` logs and
+ * rethrows, `refreshEntitlements` logs and answers 503, the `changed`
+ * callback logs and rethrows to the source). Without a source it writes
+ * nothing and resolves fresh.
  */
 export async function syncOrganization(
   rt: EntitlementsRuntime,
   organizationId: string,
 ): Promise<ResolvedState> {
   await assertOutsideTransaction(rt, "sync");
+  // one sync per organization at a time in this process, so this process's
+  // own pushes never race each other (only other processes and the sweep
+  // can make a write lose)
+  return queuedFlight(rt, `sync:${organizationId}`, () =>
+    syncNow(rt, organizationId),
+  );
+}
+
+/** One `syncOrganization` run: check, read→resolve→write with retries, fresh read. */
+async function syncNow(
+  rt: EntitlementsRuntime,
+  organizationId: string,
+): Promise<ResolvedState> {
   const adapter = await currentAdapter(rt);
   if (!(await findOrganization(adapter, organizationId))) {
     throw new Error(
@@ -538,9 +614,20 @@ export async function syncOrganization(
   }
   const source = rt.options.source;
   if (source) {
-    const previous = await readSnapshot(rt, adapter, organizationId);
-    const state = await source.resolve(organizationId, { adapter });
-    await writeSnapshot(rt, organizationId, state, { previous, adapter });
+    let written: EntitlementSnapshotRow | null = null;
+    for (let attempt = 1; !written; attempt += 1) {
+      if (attempt > SYNC_WRITE_RETRIES + 1) {
+        throw new Error(
+          `${PREFIX} syncOrganization: lost the snapshot write to concurrent writers`,
+        );
+      }
+      const previous = await readSnapshot(rt, adapter, organizationId);
+      const state = await source.resolve(organizationId, { adapter });
+      written = await writeSnapshot(rt, organizationId, state, {
+        previous,
+        adapter,
+      });
+    }
   }
   rt.cache.delete(organizationId);
   return resolveState(rt, organizationId, { bypassCache: true });

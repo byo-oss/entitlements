@@ -97,6 +97,43 @@ export function singleFlight<T>(
   return promise;
 }
 
+/**
+ * Runs `fn` for `key` so that every caller gets a run that started after
+ * it called, with at most one run going and one waiting per key in this
+ * process: with no run going, `fn` starts now; otherwise the caller joins
+ * the one waiting run (created if needed), which starts once the current
+ * run settles, whatever its outcome. Concurrent callers therefore never
+ * race each other here, and none is answered by a run that began before
+ * its call (unlike `singleFlight`).
+ */
+export function queuedFlight<T>(
+  rt: EntitlementsRuntime,
+  key: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const runningKey = `${key}:running`;
+  const waitingKey = `${key}:waiting`;
+  const start = (): Promise<T> => {
+    const promise = fn().finally(() => {
+      if (rt.flights.get(runningKey) === promise) rt.flights.delete(runningKey);
+    });
+    rt.flights.set(runningKey, promise);
+    return promise;
+  };
+  const waiting = rt.flights.get(waitingKey);
+  if (waiting) return waiting as Promise<T>;
+  const running = rt.flights.get(runningKey);
+  if (!running) return start();
+  const next = running
+    .catch(() => undefined)
+    .then(() => {
+      rt.flights.delete(waitingKey);
+      return start();
+    });
+  rt.flights.set(waitingKey, next);
+  return next;
+}
+
 /** Logs `message` as a warning the first time `key` is seen in this process. */
 export function warnOnce(
   rt: EntitlementsRuntime,

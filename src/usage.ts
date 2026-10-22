@@ -1,10 +1,13 @@
 import type { DBTransactionAdapter } from "better-auth";
+import { findOrganization } from "./adapter";
 import {
+  type AnyCatalog,
   isFeatureKey,
   type LimitValue,
   limitKind,
   type MeteredPeriod,
   planEntitlements,
+  type UpgradeTarget,
   upgradeTo,
 } from "./catalog";
 import { emit, entitlementsEvent } from "./events";
@@ -75,8 +78,25 @@ const meteredPeriod = (rt: EntitlementsRuntime, key: string): MeteredPeriod =>
 const remainingOf = (limit: LimitValue, used: number): number | "unlimited" =>
   limit === "unlimited" ? "unlimited" : Math.max(0, limit - used);
 
-const limitUpgrade = (rt: EntitlementsRuntime, key: string, atLeast: number) =>
-  upgradeTo(rt.catalog, { limit: key, atLeast });
+/**
+ * `upgradeTo` for a check result: the catalog's answer without the
+ * organization's current plan (PRD A5(b)), which can match when an override
+ * or the hook lowered a limit or turned a feature off.
+ */
+export function upgradeFrom(
+  rt: EntitlementsRuntime,
+  plan: string,
+  target: UpgradeTarget<AnyCatalog>,
+): string[] {
+  return upgradeTo(rt.catalog, target).filter((key) => key !== plan);
+}
+
+const limitUpgrade = (
+  rt: EntitlementsRuntime,
+  plan: string,
+  key: string,
+  atLeast: number,
+) => upgradeFrom(rt, plan, { limit: key, atLeast });
 
 const findBucket = (adapter: DBTransactionAdapter, bucket: string) =>
   adapter.findOne<EntitlementUsageRow>({
@@ -87,9 +107,11 @@ const findBucket = (adapter: DBTransactionAdapter, bucket: string) =>
 /**
  * Makes sure the bucket row exists. One create per bucket at a time in this
  * process (`singleFlight("bucket:<bucket>")`); inside the flight it re-reads
- * first (a caller can arrive after an earlier flight settled), and on a
- * create error (another process won the unique `bucket`) re-reads and
- * rethrows only when the row is still missing.
+ * first (a caller can arrive after an earlier flight settled), checks the
+ * organization exists (`findOrganization`) and creates nothing when it
+ * doesn't (returns false), and on a create error (another process won the
+ * unique `bucket`) re-reads and rethrows only when the row is still
+ * missing. Returns whether the bucket exists.
  */
 async function ensureBucket(
   rt: EntitlementsRuntime,
@@ -100,9 +122,11 @@ async function ensureBucket(
     key: string;
     period: UsagePeriod;
   },
-): Promise<void> {
-  await singleFlight(rt, `bucket:${input.bucket}`, async () => {
-    if (await findBucket(adapter, input.bucket)) return;
+): Promise<boolean> {
+  return singleFlight(rt, `bucket:${input.bucket}`, async () => {
+    if (await findBucket(adapter, input.bucket)) return true;
+    // the resolved state said known; the organization may be gone since
+    if (!(await findOrganization(adapter, input.organizationId))) return false;
     const now = rt.now();
     try {
       await adapter.create<
@@ -123,9 +147,10 @@ async function ensureBucket(
         },
       });
     } catch (error) {
-      if (await findBucket(adapter, input.bucket)) return;
+      if (await findBucket(adapter, input.bucket)) return true;
       throw error;
     }
+    return true;
   });
 }
 
@@ -134,7 +159,14 @@ async function ensureBucket(
  * guarded `incrementOne` first; on `null`, `findOne` the bucket, create it
  * through `singleFlight` keyed by bucket (re-read on a create error), retry
  * once; refused calls don't count `used` but increment `refused`, and the
- * first refusal per period emits `entitlements.usage.limit_reached`.
+ * first refusal per period emits `entitlements.usage.limit_reached`. A
+ * refusal answers `reason: "limit_reached"`, or `"not_in_plan"` when the
+ * limit is 0 (PRD A5(c); it still counts toward `refused` and emits).
+ * `upgradeTo` never names the current plan (A5(b)).
+ * An id that isn't an organization (`state.known` false, or no
+ * `organization` row when the bucket would be created) answers
+ * `{ allowed: false, reason: "not_in_plan", upgradeTo: [] }` and writes
+ * nothing: no bucket, no `refused`, no event, no log line.
  * `amount` (default 1) must be a positive integer.
  * Throws `[@byo-oss/entitlements] consumeUsage must run outside a
  * transaction` inside one, and `[@byo-oss/entitlements] UNKNOWN_KEY: …` for
@@ -178,6 +210,19 @@ export async function consumeUsage(
     firstRefusal: false,
   });
   if (state.result.degraded) return errorResult(state.error);
+  const unknown = (): ConsumeResult => ({
+    allowed: false,
+    reason: "not_in_plan",
+    key,
+    plan,
+    upgradeTo: [],
+    used: 0,
+    limit,
+    remaining: remainingOf(limit, 0),
+    resetAt: period.end,
+    firstRefusal: false,
+  });
+  if (!state.known) return unknown();
 
   const bucket = bucketKey(organizationId, key, period.start);
   const target = { bucket, organizationId, key, period };
@@ -201,7 +246,7 @@ export async function consumeUsage(
         });
       let row = await consume();
       if (!row && !(await findBucket(adapter, bucket))) {
-        await ensureBucket(rt, adapter, target);
+        if (!(await ensureBucket(rt, adapter, target))) return unknown();
         row = await consume();
       }
       if (row) {
@@ -210,7 +255,7 @@ export async function consumeUsage(
           reason: "ok",
           key,
           plan,
-          upgradeTo: limitUpgrade(rt, key, row.used),
+          upgradeTo: limitUpgrade(rt, plan, key, row.used),
           used: row.used,
           limit,
           remaining: remainingOf(limit, row.used),
@@ -227,7 +272,7 @@ export async function consumeUsage(
     } else {
       // amount > limit (a 0 limit included): refused before any consume, so
       // the bucket may not exist yet
-      await ensureBucket(rt, adapter, target);
+      if (!(await ensureBucket(rt, adapter, target))) return unknown();
     }
     // the first refusal is the increment that moves `refused` from 0 to 1;
     // decided by the guard rather than the returned row, because an adapter
@@ -274,10 +319,10 @@ export async function consumeUsage(
   }
   return {
     allowed: false,
-    reason: "limit_reached",
+    reason: numericLimit === 0 ? "not_in_plan" : "limit_reached",
     key,
     plan,
-    upgradeTo: limitUpgrade(rt, key, refusal.used + amount),
+    upgradeTo: limitUpgrade(rt, plan, key, refusal.used + amount),
     used: refusal.used,
     limit,
     remaining: remainingOf(limit, refusal.used),
@@ -325,7 +370,7 @@ function limitVerdict(
  * get `{ used, remaining, resetAt }` (`readUsage`; no bucket is created).
  * `allowed`/`reason`: `"not_in_plan"` when the limit is 0, metered keys
  * `"limit_reached"` when `remaining` is 0, else `"ok"`; `upgradeTo` lists
- * the plans with at least 1 (metered: `used + 1`). A failure answers
+ * the plans with at least 1 (metered: `used + 1`), never the current one. A failure answers
  * `defaultPlan` with `degraded: true`, `allowed: false` and
  * `reason: "error"`: a degraded `resolveState` is not logged again (the read
  * logged it); a `readUsage` throw is logged once here.
@@ -377,7 +422,7 @@ export async function getLimit(
       ...limitVerdict(limit, null),
       key,
       plan,
-      upgradeTo: limitUpgrade(rt, key, 1),
+      upgradeTo: limitUpgrade(rt, plan, key, 1),
       limit,
       degraded: false,
     };
@@ -406,7 +451,7 @@ export async function getLimit(
     ...limitVerdict(limit, usage.remaining),
     key,
     plan,
-    upgradeTo: limitUpgrade(rt, key, usage.used + 1),
+    upgradeTo: limitUpgrade(rt, plan, key, usage.used + 1),
     limit,
     degraded: false,
     ...usage,
@@ -415,7 +460,8 @@ export async function getLimit(
 
 /**
  * `hasFeature`: `allowed` = the resolved feature value; `reason`
- * `"not_in_plan"` when false; `upgradeTo` lists the plans with the feature.
+ * `"not_in_plan"` when false; `upgradeTo` lists the plans with the feature,
+ * never the current one.
  * A degraded `resolveState` answers `rt.options.onError(state.error, {
  * organizationId, key, operation: "hasFeature" })` with `reason: "error"`
  * and doesn't log again (the read logged it). Throws `UNKNOWN_KEY` for a key
@@ -448,6 +494,6 @@ export async function hasFeature(
     reason: allowed ? "ok" : "not_in_plan",
     key: feature,
     plan,
-    upgradeTo: upgradeTo(rt.catalog, { feature }),
+    upgradeTo: upgradeFrom(rt, plan, { feature }),
   };
 }

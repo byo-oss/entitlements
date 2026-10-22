@@ -76,7 +76,11 @@ export type AppliedOverride = {
   expiresAt: Date | null;
 };
 
-/** What `get` returns for one organization. */
+/**
+ * What `get` returns for one organization. Read-only: a result served from
+ * (or stored in) the cache is deep-frozen and shared between callers, so
+ * copy it before changing anything.
+ */
 export type EntitlementsResult<C extends AnyCatalog = AnyCatalog> = {
   organizationId: string;
   /** True when the database or the source failed and this is `defaultPlan`. */
@@ -98,13 +102,22 @@ export type EntitlementsResult<C extends AnyCatalog = AnyCatalog> = {
 /**
  * A resolution plus what the checks need beyond the result: the snapshot it
  * was computed from (null without one), whether `isEntitled` held for it
- * (false without a snapshot) and, for a degraded one, the error. What the
- * cache stores (never a degraded state).
+ * (false without a snapshot), whether the id is an organization and, for a
+ * degraded one, the error. What the cache stores (never a degraded state,
+ * never an unknown id). A cached state, and the result returned from it, is
+ * deep-frozen: results are read-only.
  */
 export type ResolvedState<C extends AnyCatalog = AnyCatalog> = {
   result: EntitlementsResult<C>;
   snapshot: EntitlementSnapshotRow | null;
   entitled: boolean;
+  /**
+   * False when the id isn't an organization (no `organization` row): the
+   * result answers `defaultPlan`, nothing is cached, and `consumeUsage`
+   * refuses with `not_in_plan` without writing. True otherwise, a degraded
+   * state included.
+   */
+  known: boolean;
   /**
    * Set whenever `result.degraded`: what the database, the source or the
    * `resolveEntitlements` hook threw. The read that degraded already logged

@@ -58,9 +58,9 @@ async function setup(config: TestAuthConfig = {}) {
     options: { source, cacheTtlMs: 0, onEvent, ...config.options },
   });
   const rt = await getRuntime(auth);
-  const { organizationId } = await seedOrg(auth);
+  const { organizationId, owner } = await seedOrg(auth);
   const api = createEntitlements(auth, testCatalog);
-  return { auth, rt, source, onEvent, organizationId, api };
+  return { auth, rt, source, onEvent, organizationId, owner, api };
 }
 
 afterEach(() => {
@@ -578,12 +578,17 @@ describe("snapshot writes and plan.changed", () => {
       version: 1,
       planKey: "team",
     });
-    // a create when the row already exists updates it instead
+    // a create when the row already exists never overwrites it (RC review 1 #1):
+    // null, and the caller re-reads or retries
     const third = await writeSnapshot(rt, organizationId, active("pro"), {
       previous: null,
       adapter,
     });
-    expect(third).toMatchObject({ version: 2, planKey: "pro" });
+    expect(third).toBeNull();
+    expect(await readSnapshot(rt, adapter, organizationId)).toMatchObject({
+      version: 1,
+      planKey: "team",
+    });
     expect(await snapshotRows(auth, organizationId)).toHaveLength(1);
   });
 
@@ -833,5 +838,185 @@ describe("syncOrganization", () => {
     const state = await syncOrganization(rt, organizationId);
     expect(state.result.plan.key).toBe("free");
     expect(await snapshotRows(auth, organizationId)).toHaveLength(0);
+  });
+});
+
+describe("cached results are read-only (RC review 1 #4)", () => {
+  it("a result from the cache is deep-frozen: a mutation throws and the next caller sees the original", async () => {
+    const { auth, rt, source, organizationId, api } = await setup({
+      options: { cacheTtlMs: 30_000 },
+    });
+    source.states.set(organizationId, active("pro"));
+    await seedOverride(auth, {
+      organizationId,
+      kind: "feature",
+      key: "sso",
+      value: true,
+    });
+    // the caller that fills the cache gets the frozen copy too
+    const first = await api.get(organizationId);
+    const second = await api.get(organizationId);
+    expect(second).toBe(first);
+    for (const result of [first, second]) {
+      expect(Object.isFrozen(result)).toBe(true);
+      expect(Object.isFrozen(result.plan)).toBe(true);
+      expect(Object.isFrozen(result.plan.display)).toBe(true);
+      expect(Object.isFrozen(result.features)).toBe(true);
+      expect(Object.isFrozen(result.limits)).toBe(true);
+      expect(Object.isFrozen(result.overrides)).toBe(true);
+      expect(Object.isFrozen(result.overrides[0])).toBe(true);
+    }
+    // test files are ES modules: strict mode, so writes throw
+    expect(() => {
+      (first.plan as { key: string }).key = "team";
+    }).toThrow(TypeError);
+    expect(() => {
+      (first.features as Record<string, boolean>).prioritySupport = true;
+    }).toThrow(TypeError);
+    expect(() => {
+      (first.limits as Record<string, unknown>).apiCalls = "unlimited";
+    }).toThrow(TypeError);
+    expect(() => {
+      first.overrides.push({
+        kind: "feature",
+        key: "exports",
+        expiresAt: null,
+      });
+    }).toThrow(TypeError);
+    const state = rt.cache.get(organizationId);
+    expect(Object.isFrozen(state)).toBe(true);
+    expect(Object.isFrozen(state?.snapshot)).toBe(true);
+    const next = await api.get(organizationId);
+    expect(next).toMatchObject({
+      plan: { key: "pro" },
+      features: { prioritySupport: false, sso: true },
+      limits: { apiCalls: 50_000 },
+    });
+    expect(next.overrides).toHaveLength(1);
+    // the catalog's own objects stay unfrozen
+    expect(Object.isFrozen(testCatalog.plans.pro.limits)).toBe(false);
+    expect(Object.isFrozen(testCatalog.plans.pro.display)).toBe(false);
+    // and checks still read it
+    expect((await api.hasFeature(organizationId, "exports")).allowed).toBe(
+      true,
+    );
+  });
+
+  it("getMany's results come from the same frozen states", async () => {
+    const { source, organizationId, api } = await setup({
+      options: { cacheTtlMs: 30_000 },
+    });
+    source.states.set(organizationId, active("team"));
+    const [result] = await api.getMany([organizationId]);
+    expect(Object.isFrozen(result)).toBe(true);
+    expect(await api.get(organizationId)).toBe(result);
+  });
+});
+
+describe("syncOrganization: lost writes (RC review 1 #1)", () => {
+  it("a write that loses to a concurrent writer retries with a fresh read and resolve, so the newer state wins", async () => {
+    const { auth, rt, source, organizationId } = await setup();
+    await setSnapshot(auth, organizationId, active("pro"));
+    const { adapter } = await getContext(auth);
+    const resolve = source.resolve;
+    let calls = 0;
+    source.resolve = async (id, ctx) => {
+      calls += 1;
+      const state = await resolve(id, ctx);
+      if (calls === 1) {
+        // another process stores newer state after this call's read
+        const row = await readSnapshot(rt, adapter, id);
+        await adapter.update({
+          model: "entitlementSnapshot",
+          where: [{ field: "id", value: row?.id as string }],
+          update: { planKey: "team", version: (row?.version ?? 0) + 1 },
+        });
+        source.states.set(id, active("team"));
+      }
+      return state;
+    };
+    source.states.set(organizationId, active("pro", { seats: 2 }));
+    const state = await syncOrganization(rt, organizationId);
+    expect(calls).toBe(2);
+    expect(state.result.plan.key).toBe("team");
+    expect(await readSnapshot(rt, adapter, organizationId)).toMatchObject({
+      planKey: "team",
+      version: 2,
+    });
+  });
+
+  it("retries a lost write 3 times (4 attempts), then throws; refreshEntitlements answers 503 and logs once", async () => {
+    const { auth, rt, source, organizationId, owner } = await setup();
+    const seeded = await setSnapshot(auth, organizationId, active("pro"));
+    const { adapter } = await getContext(auth);
+    const resolve = source.resolve;
+    let calls = 0;
+    source.resolve = async (id, ctx) => {
+      calls += 1;
+      const row = await readSnapshot(rt, adapter, id);
+      // a writer that always lands between the read and the write
+      await adapter.update({
+        model: "entitlementSnapshot",
+        where: [{ field: "id", value: seeded.id }],
+        update: { version: (row?.version ?? 0) + 1 },
+      });
+      return resolve(id, ctx);
+    };
+    source.states.set(organizationId, active("team"));
+    await expect(syncOrganization(rt, organizationId)).rejects.toThrow(
+      "[@byo-oss/entitlements] syncOrganization: lost the snapshot write to concurrent writers",
+    );
+    expect(calls).toBe(4);
+    expect((await readSnapshot(rt, adapter, organizationId))?.planKey).toBe(
+      "pro",
+    );
+
+    const error = vi.fn();
+    rt.logger = { ...rt.logger, error };
+    calls = 0;
+    await expect(
+      auth.api.refreshEntitlements({
+        body: { organizationId },
+        headers: owner.headers,
+      }),
+    ).rejects.toMatchObject({ status: "SERVICE_UNAVAILABLE" });
+    expect(calls).toBe(4);
+    expect(error).toHaveBeenCalledTimes(1);
+  });
+
+  it("concurrent syncs in one process run one at a time; a call made during a run shares the next run", async () => {
+    const { auth, rt, source, organizationId } = await setup();
+    const { adapter } = await getContext(auth);
+    const resolve = source.resolve;
+    let open: () => void = () => {};
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    let calls = 0;
+    source.resolve = async (id, ctx) => {
+      calls += 1;
+      const state = await resolve(id, ctx);
+      if (calls === 1) await gate;
+      return state;
+    };
+    source.states.set(organizationId, active("pro"));
+    const first = syncOrganization(rt, organizationId);
+    await vi.waitFor(() => expect(calls).toBe(1));
+    // the provider changes while the first sync holds the old state
+    source.states.set(organizationId, active("team"));
+    const later = Array.from({ length: 5 }, () =>
+      syncOrganization(rt, organizationId),
+    );
+    open();
+    const [a, ...rest] = await Promise.all([first, ...later]);
+    expect(a?.result.plan.key).toBe("pro");
+    for (const state of rest) expect(state.result.plan.key).toBe("team");
+    // one run for the first call, one shared by the five that waited
+    expect(calls).toBe(2);
+    expect(await readSnapshot(rt, adapter, organizationId)).toMatchObject({
+      planKey: "team",
+      version: 1,
+    });
+    expect(rt.flights.size).toBe(0);
   });
 });

@@ -1,8 +1,8 @@
-import { type LimitValue, upgradeTo } from "./catalog";
+import type { LimitValue } from "./catalog";
 import { resolveState } from "./resolve";
 import type { EntitlementsRuntime } from "./runtime";
 import type { CapacityResult } from "./types";
-import { assertKey, onErrorAllows } from "./usage";
+import { assertKey, onErrorAllows, upgradeFrom } from "./usage";
 
 const isCount = (value: unknown): value is number =>
   typeof value === "number" && Number.isInteger(value) && value >= 0;
@@ -10,8 +10,10 @@ const isCount = (value: unknown): value is number =>
 /**
  * `checkCapacity` (capacity keys only): `allowed = count + adding <= limit`
  * (`"unlimited"` always allows), `over = count > limit`, `reason`
- * `"limit_reached"` when refused, with `upgradeTo` for
- * `count + adding`. `adding` defaults to 1; `count` and `adding` are
+ * `"limit_reached"` when refused, with `upgradeTo` for `count + adding`
+ * (never the current plan, PRD A5(b)). A 0 limit means "not included"
+ * (A5(c)): always refused with `reason: "not_in_plan"`, `{ count: 0,
+ * adding: 0 }` included. `adding` defaults to 1; `count` and `adding` are
  * non-negative integers (else it throws). Works inside a transaction. A
  * degraded `resolveState` answers `rt.options.onError(state.error, {
  * organizationId, key, operation: "checkCapacity" })` with `reason:
@@ -51,13 +53,17 @@ export async function checkCapacity(
       over: false,
     };
   }
-  const allowed = limit === "unlimited" || count + adding <= limit;
+  const allowed =
+    limit === "unlimited" || (limit !== 0 && count + adding <= limit);
   return {
     allowed,
-    reason: allowed ? "ok" : "limit_reached",
+    reason: allowed ? "ok" : limit === 0 ? "not_in_plan" : "limit_reached",
     key,
     plan,
-    upgradeTo: upgradeTo(rt.catalog, { limit: key, atLeast: count + adding }),
+    upgradeTo: upgradeFrom(rt, plan, {
+      limit: key,
+      atLeast: Math.max(1, count + adding),
+    }),
     count,
     limit,
     over: limit !== "unlimited" && count > limit,

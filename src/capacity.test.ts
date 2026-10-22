@@ -57,7 +57,8 @@ describe("checkCapacity (PRD #14)", () => {
       reason: "ok",
       key: "members",
       plan: "free",
-      upgradeTo: ["free", "pro", "team"],
+      // never the current plan (PRD A5(b))
+      upgradeTo: ["pro", "team"],
       count: 4,
       limit: 5,
       over: false,
@@ -245,5 +246,36 @@ describe("checkCapacity (PRD #14)", () => {
       // the read's own line only
       expect(t.error).toHaveBeenCalledTimes(1);
     }
+  });
+});
+
+describe("checkCapacity: a 0 limit and upgradeTo (PRD A5(b), A5(c))", () => {
+  it("a 0 limit is not_in_plan, even for { count: 0, adding: 0 }", async () => {
+    const t = await setup({ limits: { members: 0 } });
+    for (const opts of [{ count: 0 }, { count: 0, adding: 0 }, { count: 3 }]) {
+      expect(
+        await t.api.checkCapacity(t.organizationId, "members", opts),
+      ).toMatchObject({
+        allowed: false,
+        reason: "not_in_plan",
+        limit: 0,
+        plan: "free",
+        upgradeTo: ["pro", "team"],
+      });
+    }
+  });
+
+  it("upgradeTo never names the current plan, even when the hook lowered its limit below the catalog's", async () => {
+    // free has members 5 in the catalog; the hook makes it 2
+    const t = await setup({ limits: { members: 2 } });
+    const refused = await t.api.checkCapacity(t.organizationId, "members", {
+      count: 2,
+    });
+    expect(refused).toMatchObject({
+      allowed: false,
+      reason: "limit_reached",
+      plan: "free",
+    });
+    expect(refused.upgradeTo).toEqual(["pro", "team"]);
   });
 });

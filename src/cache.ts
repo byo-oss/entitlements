@@ -57,3 +57,41 @@ export function createCache(options: {
     },
   };
 }
+
+/**
+ * A deep-frozen copy of `value`: plain objects, arrays and `Date`s are
+ * copied, then frozen; anything else (functions, class instances an app put
+ * in a plan's `display`) is shared as is. Copying first keeps the freeze off
+ * objects the adapter or the catalog own.
+ */
+function frozenCopy<T>(value: T): T {
+  if (value instanceof Date) {
+    return Object.freeze(new Date(value.getTime())) as T;
+  }
+  if (Array.isArray(value)) {
+    return Object.freeze(value.map((item) => frozenCopy(item))) as T;
+  }
+  if (typeof value === "object" && value !== null) {
+    const proto = Object.getPrototypeOf(value);
+    if (proto !== Object.prototype && proto !== null) return value;
+    const copy: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) {
+      copy[key] = frozenCopy(item);
+    }
+    return Object.freeze(copy) as T;
+  }
+  return value;
+}
+
+/**
+ * The state the cache stores and every caller gets back from it: a
+ * deep-frozen copy (`result` and `snapshot`), so one caller changing a
+ * result can't change what the next one reads. Results are read-only.
+ */
+export function freezeState(state: ResolvedState): ResolvedState {
+  return Object.freeze({
+    ...state,
+    result: frozenCopy(state.result),
+    snapshot: frozenCopy(state.snapshot),
+  });
+}

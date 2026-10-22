@@ -139,7 +139,7 @@ describe("runSync on SQL: claims (PRD #17)", () => {
     });
     expect(await snapshotOf(t.auth, organizationId)).toMatchObject({
       planKey: "pro",
-      version: 1,
+      version: 2, // the claim and the write each move it (RC review 1 #1)
       syncState: "idle",
       syncClaimedAt: null,
       syncAttempts: 0,
@@ -219,7 +219,7 @@ describe("runSync on SQL: claims (PRD #17)", () => {
       .execute();
     expect(rows).toHaveLength(4);
     for (const row of rows) {
-      expect(row).toEqual({ version: 1, syncState: "idle", planKey: "pro" });
+      expect(row).toEqual({ version: 2, syncState: "idle", planKey: "pro" });
     }
   });
 
@@ -272,7 +272,7 @@ describe("runSync on SQL: claims (PRD #17)", () => {
     expect(await runSync(t.rt)).toMatchObject({ synced: 1 });
     expect(await snapshotOf(t.auth, organizationId)).toMatchObject({
       planKey: "team",
-      version: 1,
+      version: 2, // the sweep's claim, then the push's write
       syncState: "idle",
       syncClaimedAt: null,
     });
@@ -360,7 +360,7 @@ async function expectSweptInside(t: Setup, work: SweepWork) {
       syncState: "idle",
       syncClaimedAt: null,
       syncAttempts: 0,
-      version: (work.before[i]?.version ?? 0) + 1,
+      version: (work.before[i]?.version ?? 0) + 2,
     });
   }
   expect(inside.override).toMatchObject({
@@ -388,7 +388,7 @@ async function expectSwept(t: Setup, work: SweepWork) {
     expect(await snapshotOf(t.auth, id)).toMatchObject({
       planKey: ["pro", "team"][i],
       syncState: "idle",
-      version: (work.before[i]?.version ?? 0) + 1,
+      version: (work.before[i]?.version ?? 0) + 2,
     });
   }
   expect(await overrideOf(t.auth, work.lapsed.id)).toMatchObject({
@@ -484,7 +484,7 @@ describe("runSync on SQL: retries and state (PRD #17)", () => {
     expect(await snapshotOf(t.auth, organizationId)).toMatchObject({
       planKey: "pro",
       status: "active",
-      version: 0,
+      version: 2, // two claims, no write
       syncAttempts: 2,
       syncError: "provider down",
       nextSyncAt: at(later, t.rt.options.maxAge),
@@ -686,5 +686,88 @@ describe("runSync on SQL: expiry and prunes (PRD #17)", () => {
     }
     expect(await runSync(t.rt)).toMatchObject({ synced: 2, hasMore: true });
     expect(await runSync(t.rt)).toMatchObject({ synced: 1, hasMore: false });
+  });
+
+  it("batchSize is one budget per call: claims first, then expiry and the two prunes share what is left (PRD A5(d))", async () => {
+    const t = await setup({ options: { batchSize: 3 } });
+    const { organizationId } = await seedOrg(t.auth);
+    for (let i = 0; i < 2; i++) {
+      const org = await seedOrg(t.auth);
+      await setSnapshot(t.auth, org.organizationId, {
+        ...due(),
+        nextSyncAt: at(NOW, -(i + 1) * MINUTE),
+      });
+    }
+    for (const key of ["sso", "exports"]) {
+      await seedOverride(t.auth, {
+        organizationId,
+        kind: "feature",
+        key,
+        expiresAt: at(NOW, -HOUR),
+      });
+    }
+    const { usageRetention, overrideRetention } = t.rt.options;
+    for (let i = 0; i < 2; i++) {
+      await seedUsage(t.auth, {
+        organizationId,
+        key: "uploads",
+        periodStart: at(NOW, -usageRetention - (40 + i) * DAY),
+        periodEnd: at(NOW, -usageRetention - (10 + i) * DAY),
+      });
+    }
+    await seedOverride(t.auth, {
+      organizationId,
+      kind: "feature",
+      key: "prioritySupport",
+      status: "removed",
+      endedAt: at(NOW, -overrideRetention - DAY),
+    });
+
+    // 2 claims + 1 expiry = 3; the prunes get nothing
+    expect(await runSync(t.rt)).toEqual({
+      synced: 2,
+      skipped: 0,
+      retrying: 0,
+      failed: 0,
+      expired: 1,
+      pruned: 0,
+      hasMore: true,
+    });
+    // 1 expiry + 2 usage prunes = 3; the override prune gets nothing
+    expect(await runSync(t.rt)).toMatchObject({
+      synced: 0,
+      expired: 1,
+      pruned: 2,
+      hasMore: true,
+    });
+    expect(await runSync(t.rt)).toMatchObject({
+      synced: 0,
+      expired: 0,
+      pruned: 1,
+      hasMore: false,
+    });
+    expect(await runSync(t.rt)).toMatchObject({
+      synced: 0,
+      expired: 0,
+      pruned: 0,
+      hasMore: false,
+    });
+  });
+
+  it("a released stale claim takes from the same budget", async () => {
+    const t = await setup({ options: { batchSize: 1 } });
+    const { organizationId } = await seedOrg(t.auth);
+    await setSnapshot(t.auth, organizationId, {
+      ...due(),
+      syncState: "syncing",
+      syncClaimedAt: at(NOW, -t.rt.options.leaseMs),
+      syncAttempts: 1,
+    });
+    t.source.states.set(organizationId, active("pro"));
+    // the release uses the whole budget; the claim waits for the next call
+    expect(await runSync(t.rt)).toMatchObject({ synced: 0, hasMore: true });
+    expect((await snapshotOf(t.auth, organizationId))?.syncState).toBe("idle");
+    expect(await runSync(t.rt)).toMatchObject({ synced: 1, hasMore: false });
+    expect((await snapshotOf(t.auth, organizationId))?.planKey).toBe("pro");
   });
 });

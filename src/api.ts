@@ -34,10 +34,13 @@ export type GetLimitResult<C extends AnyCatalog, K extends LimitKey<C>> =
  * `degraded: true`, and `hasFeature`, `consumeUsage` and `checkCapacity`
  * answer what `onError` says, with `reason: "error"`. `sync` is the
  * exception: it throws when the billing source or the database fails.
- * `consumeUsage` and `sync` throw inside a transaction.
+ * `consumeUsage` and `sync` throw inside a transaction. Results are
+ * read-only: a cached one is deep-frozen and shared with later callers.
+ * A refusal's `upgradeTo` never names the current plan, and a 0 limit
+ * answers `reason: "not_in_plan"`.
  */
 export type Entitlements<C extends AnyCatalog> = {
-  /** The organization's resolved plan, features, limits and live overrides. */
+  /** The organization's resolved plan, features, limits and live overrides (read-only). */
   get(organizationId: string): Promise<EntitlementsResult<C>>;
   /** `get` for up to 1000 organizations, in the order given. `[]` → `[]`. */
   getMany(organizationIds: readonly string[]): Promise<EntitlementsResult<C>[]>;
@@ -66,7 +69,8 @@ export type Entitlements<C extends AnyCatalog> = {
   /**
    * Resyncs from the billing source now and returns the fresh result (cache
    * bypassed). Throws when the source or the database fails (nothing is
-   * persisted; the failure is logged once), and inside a transaction.
+   * persisted; the failure is logged once), when 4 attempts in a row (3 retries) lose
+   * the snapshot write to concurrent writers, and inside a transaction.
    */
   sync(organizationId: string): Promise<EntitlementsResult<C>>;
   /** Clears this process's cached result for the organization. */
