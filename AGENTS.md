@@ -17,19 +17,31 @@ Optional: render `useEntitlements`, `EntitlementGate` and `UsageMeter` from `@by
 ## Rules
 
 - Gate with `createEntitlements` (`hasFeature`, `getLimit`, `consumeUsage`, `checkCapacity`), never by reading the plugin's tables or comparing plan names. Checks return `{ allowed, reason, upgradeTo }`; build the refusal from that.
-- `consumeUsage`, `sync` and `refreshEntitlements` throw inside a transaction. Call them before or after it. Reads and `checkCapacity` work inside one.
+- `consumeUsage`, `sync(orgId)` and `refreshEntitlements` throw inside a transaction. Call them before or after it. Reads and `checkCapacity` work inside one, and the sweep (`processEntitlementsSync`, `byo.sweep`) joins it. Events fire when the adapter write returns, so inside a transaction one can announce a write that rolls back.
 - Every duration option is in milliseconds except `pastDueGraceDays`. `maxAge` must be at least 60000; `usageRetention` and `overrideRetention` at least 86400000.
 - Never rename a plan key that has subscribers; add a `planAliases` entry. Prices live in Stripe, not the catalog.
 - Staff overrides are checked in `staffOrganizationId`, never in the target organization. Without it (or a custom `authorize`) the override endpoints deny every call.
-- A custom `acceptSession` replaces the default, so keep its impersonation rule. API-key and bearer sessions on override endpoints are refused there.
+- The default `acceptSession` refuses impersonated sessions only (on staff calls and every POST). Refusing API-key or bearer sessions on the override endpoints is an app choice. A custom `acceptSession` replaces the default, so it keeps the impersonation rule and adds its own:
+
+  ```ts
+  // lib/accept-session.ts
+  import type { EntitlementsAcceptSession } from "@byo-oss/entitlements"
+
+  export const acceptSession: EntitlementsAcceptSession = ({ session, kind, method, path, headers }) => {
+    if (session.session.impersonatedBy && (kind === "staff" || method === "POST")) return false
+    const bearer = headers?.get("authorization")?.startsWith("Bearer ")
+    if (path.startsWith("/entitlements/override") && (bearer || headers?.has("x-api-key"))) return false
+    return true
+  }
+  ```
 - Deleting organizations outside `/organization/delete` needs `deleteOrganizationData(auth, organizationId)`. Export with `exportEntitlementsData`, looping on `nextCursor`.
 - A billing provider other than Stripe is a `BillingSource` (`byo-entitlements-<provider>`). Test it with `testBillingSource` from `@byo-oss/entitlements/testing`.
 
 ## Working on this repo
 
-- `pnpm install` (run `mise trust` and `mise install` first), then `pnpm typecheck`, `pnpm lint`, `pnpm test`.
+- `pnpm install`, then `pnpm typecheck`, `pnpm lint`, `pnpm test`.
 - Lanes: `pnpm test:sql` (PGlite through Kysely), `pnpm test:stripe` (real `@better-auth/stripe`, fake Stripe client), `pnpm test:min` (the better-auth 1.7.7 set), `pnpm test:dist` (after `pnpm build`).
 - Tests run a real better-auth instance on the memory adapter behind a strict adapter wrapper (`src/test-utils.ts`): every `findMany` needs a `limit`, `in` lists hold 1 to 90 values, no `where` mixes `AND` and `OR`.
 - Read the clock through `rt.now()`, and resolve the adapter once per operation with `currentAdapter(rt)`. Never import `@better-auth/core` at runtime.
-- Public changes (exports, options, schema, documented behaviour) update `README.md`, `llms.txt` and the skill in the same change.
+- Public changes (exports, options, schema, documented behaviour) update `README.md`, `llms.txt` and the skill in the same change. Every `ts`/`tsx` sample in them must be complete and compile when pasted: `pnpm build && node scripts/check-docs-samples.mjs`.
 - Follow the BYO conventions: https://github.com/byo-oss/conventions/blob/main/SPEC.md

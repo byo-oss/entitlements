@@ -139,8 +139,10 @@ Five steps. Each ends on a check.
 
    export const gate = createEntitlements(auth, catalog)
 
-   const result = await gate.hasFeature(organizationId, "exports")
-   // { allowed: false, reason: "not_in_plan", key: "exports", plan: "free", upgradeTo: ["pro"] }
+   export async function canExport(organizationId: string) {
+     return gate.hasFeature(organizationId, "exports")
+     // { allowed: false, reason: "not_in_plan", key: "exports", plan: "free", upgradeTo: ["pro"] }
+   }
    ```
 
    `"exprts"` is a type error. Done when a Free organization gets `allowed: false` with `upgradeTo: ["pro"]`.
@@ -185,19 +187,34 @@ Every duration is in milliseconds except `pastDueGraceDays` (days). A value give
 
 Boot validation throws `[@byo-oss/entitlements] …` for: a bad catalog (missing or unknown key, bad plan key, bad limit, bad alias, more than 150 keys), `defaultPlan` not in `plans`, an empty `staffOrganizationId`, a source without a non-empty `id` or a `resolve` function (`"none"` is reserved), and a numeric option out of range.
 
+The default `acceptSession` refuses impersonated sessions and nothing else. Refusing API-key and bearer callers on the override endpoints is your choice; a custom `acceptSession` replaces the default, so it keeps the impersonation rule and adds that one:
+
 ```ts
-entitlements({
-  catalog,
-  // plan-level adjustments: paid seats override the plan's member limit
-  resolveEntitlements: ({ snapshot }) =>
-    snapshot?.seats ? { limits: { members: snapshot.seats } } : {},
-  // a custom acceptSession replaces the default, so keep its impersonation rule
-  acceptSession: ({ session, kind, method, path, headers }) => {
-    if (session.session.impersonatedBy && (kind === "staff" || method === "POST")) return false
-    const bearer = headers?.get("authorization")?.startsWith("Bearer ")
-    if (path.startsWith("/entitlements/override") && (bearer || headers?.has("x-api-key"))) return false
-    return true
-  },
+// lib/auth-options.ts
+import { betterAuth } from "better-auth"
+import { organization } from "better-auth/plugins/organization"
+import { entitlements } from "@byo-oss/entitlements"
+import { catalog } from "./catalog"
+
+export const auth = betterAuth({
+  plugins: [
+    organization(),
+    entitlements({
+      catalog,
+      staffOrganizationId: process.env.STAFF_ORGANIZATION_ID,
+      // plan-level adjustments: paid seats override the plan's member limit
+      resolveEntitlements: ({ snapshot }) =>
+        snapshot?.seats ? { limits: { members: snapshot.seats } } : {},
+      acceptSession: ({ session, kind, method, path, headers }) => {
+        // the default's rule: no impersonated sessions on staff calls or POSTs
+        if (session.session.impersonatedBy && (kind === "staff" || method === "POST")) return false
+        // your own rule: no bearer or API-key callers on the override endpoints
+        const bearer = headers?.get("authorization")?.startsWith("Bearer ")
+        if (path.startsWith("/entitlements/override") && (bearer || headers?.has("x-api-key"))) return false
+        return true
+      },
+    }),
+  ],
 })
 ```
 
@@ -222,27 +239,37 @@ The client exposes them as `client.entitlements.get({ query })`, `.refresh({ org
 
 ### Server functions
 
-`createEntitlements(auth, catalog)` returns these, typed by your catalog. They take a plain organization id, so you can wrap them behind your own tenant checks. Reads and checks never throw for a refusal or an outage.
+`createEntitlements(auth, catalog)` returns the first eight, typed by your catalog. They take a plain organization id, so you can wrap them behind your own tenant checks. Reads and checks never throw for a refusal or an outage. The last three rows are not on that object: `deleteOrganizationData` and `exportEntitlementsData` are separate imports from `@byo-oss/entitlements`, and `processEntitlementsSync` is an `auth.api` call.
 
 | Function | Kind | Returns |
 |---|---|---|
 | `get(orgId)` | server function | plan (`key`, `display`, `source`), `status`, `periodEnd`, `cancelAtPeriodEnd`, `features`, `limits`, applied `overrides`, `degraded` |
 | `getMany(orgIds)` | server function | `get` for up to 1000 ids, in order. `[]` returns `[]` with no query; more than 1000 throws |
 | `hasFeature(orgId, feature)` | server function | `{ allowed, reason, key, plan, upgradeTo }` |
-| `getLimit(orgId, key)` | server function | `{ limit, allowed, reason, upgradeTo, degraded }`; metered keys add `{ used, remaining, resetAt }`. Consumes nothing. A limit of 0 reads `not_in_plan`; a metered key with nothing left reads `limit_reached` |
+| `getLimit(orgId, key)` | server function | `{ key, plan, limit, allowed, reason, upgradeTo, degraded }`; metered keys add `{ used, remaining, resetAt }`. Consumes nothing. A limit of 0 reads `not_in_plan`; a metered key with nothing left reads `limit_reached` |
 | `consumeUsage(orgId, key, { amount? })` | server function | `{ allowed, reason, used, limit, remaining, resetAt, firstRefusal, plan, upgradeTo }`. Metered keys only; `amount` is a positive integer (default 1) |
 | `checkCapacity(orgId, key, { count, adding? })` | server function | `{ allowed, reason, count, limit, over, plan, upgradeTo }`. Capacity keys only; `allowed` is `count + adding <= limit` |
-| `sync(orgId)` | server function | the fresh result. Throws when the source or database fails |
+| `sync(orgId)` | server function | the fresh result; also refreshes a stale snapshot. Throws when the source or database fails, and inside a transaction |
 | `invalidate(orgId)` | server function | clears this process's cache entry |
 | `deleteOrganizationData(auth, orgId)` | server function | deletes the organization's rows (see Uninstall and Lifecycle) |
 | `exportEntitlementsData(auth, options)` | server function | one page of rows (see Export) |
 | `processEntitlementsSync` | server-only | via `auth.api`, see Freshness |
 
-`reason` is `"ok"`, `"not_in_plan"`, `"limit_reached"` or `"error"`. A key of the wrong kind, or an invalid `amount` or `count`, throws a programmer error (`UNKNOWN_KEY`), never a refusal.
+`reason` is `"ok"`, `"not_in_plan"`, `"limit_reached"` or `"error"`. Bad arguments throw a programmer error, never a refusal:
+
+- A key of the wrong kind (a feature where a metered key is expected, say) throws `[@byo-oss/entitlements] UNKNOWN_KEY: …`.
+- An invalid `amount` throws `[@byo-oss/entitlements] consumeUsage: amount must be a positive integer`.
+- An invalid `count` or `adding` throws `[@byo-oss/entitlements] checkCapacity: count and adding must be non-negative integers`.
+
+Only the first carries the `UNKNOWN_KEY` code; the other two are plain `Error`s with those messages.
 
 ```ts
-const r = await gate.consumeUsage(organizationId, "apiCalls")
-if (!r.allowed) {
+// lib/guard.ts (server only)
+import { gate } from "./gate"
+
+export async function guardApiCall(organizationId: string): Promise<Response | null> {
+  const r = await gate.consumeUsage(organizationId, "apiCalls")
+  if (r.allowed) return null
   const status = r.reason === "error" ? 503 : 429
   return new Response("Limit reached", {
     status,
@@ -282,7 +309,7 @@ Override rules: `key` must be in the catalog for its `kind` (a plan alias is not
 | `OVERRIDE_NOT_FOUND` | 404 | removing a missing or non-active override |
 | `ENTITLEMENTS_UNAVAILABLE` | 503 | a degraded read, a sync that threw, a usage read that threw |
 | `INVALID_CURSOR` | 400 | a malformed list cursor, or a page past the tie bound |
-| `UNKNOWN_KEY` | thrown `Error`, not HTTP | a key of the wrong kind from untyped callers |
+| `UNKNOWN_KEY` | thrown `Error`, not HTTP | a key of the wrong kind from untyped callers. A bad `amount`, `count` or `adding` throws a plain `Error` with its own message instead |
 
 ### Events
 
@@ -290,29 +317,42 @@ Pass `onEvent` to receive these (`actorId` is the staff user for overrides and `
 
 | `type` | When | `subject` | `data` |
 |---|---|---|---|
-| `entitlements.plan.changed` | a write changes the resolved plan key | organization | `{ from, to, status }` |
+| `entitlements.plan.changed` | a snapshot write changes the resolved plan key. Overrides never emit it: a plan override changes the plan without this event | organization | `{ from, to, status }` |
 | `entitlements.override.set` | an override is created or replaced | `entitlementOverride` | `{ kind, key, value, expiresAt }` |
 | `entitlements.override.removed` | staff removed an override (expiry emits nothing) | `entitlementOverride` | `{ kind, key }` |
 | `entitlements.usage.limit_reached` | the first refusal of a metered key in a period | organization | `{ key, limit, periodEnd }` |
 
-To tell the owners about a limit, route the event to [`@byo-oss/notifications`](https://github.com/byo-oss/notifications):
+To tell the owners about a limit, route the event to [`@byo-oss/notifications`](https://github.com/byo-oss/notifications). `auth.api.notify` exists only when that package is installed and its `inbox()` plugin is in `plugins`; without it the call does not compile. Use the event's `type` as the notification `type` (SPEC P2), so the inbox's throttling and preferences apply to it:
 
 ```ts
-entitlements({
-  catalog,
-  // annotate the return type so TypeScript doesn't infer `auth` from itself
-  onEvent: async (event): Promise<void> => {
-    if (event.type !== "entitlements.usage.limit_reached" || !event.organizationId) return
-    await auth.api.notify({
-      body: {
-        organizationId: event.organizationId,
-        roles: ["owner", "admin"],
-        type: "entitlements.limit_reached",
-        title: `You reached your ${String(event.data.key)} limit`,
-        href: "/billing",
+// lib/auth-notify.ts
+import { betterAuth } from "better-auth"
+import { organization } from "better-auth/plugins/organization"
+import { inbox } from "@byo-oss/notifications"
+import { entitlements } from "@byo-oss/entitlements"
+import { catalog } from "./catalog"
+
+export const auth = betterAuth({
+  plugins: [
+    organization(),
+    inbox(),
+    entitlements({
+      catalog,
+      // annotate the return type so TypeScript doesn't infer `auth` from itself
+      onEvent: async (event): Promise<void> => {
+        if (event.type !== "entitlements.usage.limit_reached") return
+        await auth.api.notify({
+          body: {
+            organizationId: event.organizationId,
+            roles: ["owner", "admin"],
+            type: event.type,
+            title: `You reached your ${event.data.key} limit`,
+            href: "/billing",
+          },
+        })
       },
-    })
-  },
+    }),
+  ],
 })
 ```
 
@@ -321,10 +361,16 @@ entitlements({
 `@byo-oss/entitlements/react` has a headless hook and two thin components. Pass your auth client as a prop; there is no global.
 
 ```tsx
+// components/exports.tsx
 import { EntitlementGate, UsageMeter, useEntitlements } from "@byo-oss/entitlements/react"
-import { catalog } from "./catalog"
+import { authClient } from "../lib/auth-client"
+import { catalog } from "../lib/catalog"
 
-function Exports({ organizationId }: { organizationId: string }) {
+function ExportButton() {
+  return <button type="button">Export</button>
+}
+
+export function Exports({ organizationId }: { organizationId: string }) {
   const entitlements = useEntitlements<typeof catalog>({ client: authClient, organizationId })
   return (
     <>
@@ -357,7 +403,11 @@ function Exports({ organizationId }: { organizationId: string }) {
 A `BillingSource` tells the package what an organization has bought:
 
 ```ts
-interface BillingSource {
+// the shape of BillingSource, which @byo-oss/entitlements exports
+import type { AuthContext, DBTransactionAdapter } from "better-auth"
+import type { BillingState } from "@byo-oss/entitlements"
+
+export interface BillingSource {
   readonly id: string
   resolve(organizationId: string, ctx: { adapter: DBTransactionAdapter }): Promise<BillingState | null>
   connect?(context: AuthContext, changed: (organizationId: string) => Promise<void>): void | Promise<void>
@@ -369,23 +419,31 @@ interface BillingSource {
 **Stripe.** `fromBetterAuthStripe()` reads the `subscription` table of `@better-auth/stripe` and never writes it. Derive that plugin's `plans` from the catalog with `stripePlans` so the two can't drift:
 
 ```ts
+// lib/auth-stripe.ts
 import Stripe from "stripe"
+import { betterAuth } from "better-auth"
+import { organization } from "better-auth/plugins/organization"
 import { stripe } from "@better-auth/stripe"
+import { entitlements } from "@byo-oss/entitlements"
 import { fromBetterAuthStripe, stripePlans } from "@byo-oss/entitlements/stripe"
+import { ac, roles } from "./permissions"
+import { catalog } from "./catalog"
 
-plugins: [
-  organization({ ac, roles }),
-  stripe({
-    stripeClient: new Stripe(process.env.STRIPE_SECRET_KEY!),
-    stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET!,
-    organization: { enabled: true },
-    subscription: {
-      enabled: true,
-      plans: stripePlans(catalog, { pro: { priceId: process.env.STRIPE_PRO_PRICE_ID! } }),
-    },
-  }),
-  entitlements({ catalog, source: fromBetterAuthStripe() }),
-]
+export const auth = betterAuth({
+  plugins: [
+    organization({ ac, roles }),
+    stripe({
+      stripeClient: new Stripe(process.env.STRIPE_SECRET_KEY!),
+      stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET!,
+      organization: { enabled: true },
+      subscription: {
+        enabled: true,
+        plans: stripePlans(catalog, { pro: { priceId: process.env.STRIPE_PRO_PRICE_ID! } }),
+      },
+    }),
+    entitlements({ catalog, source: fromBetterAuthStripe() }),
+  ],
+})
 ```
 
 - `stripePlans` sets each plan's `name` to the plan key and its `limits` to the catalog's limits. Those are for the Stripe plugin's own display and are never read back; Stripe holds which plan and status, the catalog holds what the plan allows.
@@ -454,6 +512,8 @@ The three tables are a public contract. They reference `organization` with `onDe
 
 Indexes are declared on the plugin schema (`index: true`, `unique: true`).
 
+**Don't read these tables from app code.** They are a contract for migrations and exports, not an API. Gate through `createEntitlements`, `auth.api.*` and the client, so the day you move to another tool only those call sites change (see Outgrowing this).
+
 **MongoDB.** The adapter creates no unique indexes from the schema, so two are required: `entitlementSnapshot.organizationId` and `entitlementUsage.bucket`, both unique. Without them, concurrent first writes from several processes can create duplicates and over-allow.
 
 ## Freshness
@@ -483,8 +543,12 @@ Earlier better-auth versions guard only a subquery on Postgres, which is why the
 Every function and endpoint reads and writes through better-auth's `getCurrentAdapter`, so a call made inside your `runWithTransaction` uses that transaction instead of the outer connection. The rules apply to adapters with real transactions; on one without (Kysely without `transaction: true`) detection reads "outside", which is safe because there is nothing to wait on or roll back.
 
 - `get`, `getMany`, `hasFeature`, `getLimit` and `checkCapacity` work inside a transaction. They may read the cache but never write it, never persist a snapshot (a missing one resolves without writing) and never schedule a refresh; the next read outside a transaction refreshes.
-- `consumeUsage`, `sync` and `refreshEntitlements` throw `[@byo-oss/entitlements] <name> must run outside a transaction`, because a bucket create could abort your transaction and a consumption rolled back with it would be invisible to others. Call them before or after the transaction.
-- Override writes (`setEntitlementOverride`, `removeEntitlementOverride`) join the transaction and roll back with it. Their `override.set` and `override.removed` events are emitted before you commit, so an event can announce a write that later rolls back. better-auth exposes no after-commit hook to plugins.
+- `consumeUsage`, `sync(orgId)` and `refreshEntitlements` throw `[@byo-oss/entitlements] <name> must run outside a transaction`, because a bucket or snapshot create could abort your transaction and a consumption rolled back with it would be invisible to others. Call them before or after the transaction.
+- `processEntitlementsSync`, `byo.sweep` and `@byo-oss/core`'s `sweepAll` join your transaction instead of throwing, and roll back with it: the sweep only updates and deletes existing rows, so it can't abort the transaction with a create conflict. Their `plan.changed` events are emitted before you commit.
+  - Inside a joined transaction the cache entry is cleared before the commit, so a read made outside the transaction in that window can re-cache the old state until `cacheTtlMs`. Override writes made inside a transaction behave the same way.
+  - On Postgres, a database error inside a joined sweep aborts your transaction: the sweep reports `retrying` and your commit then fails. Run sweeps outside app transactions unless you want them to roll back together.
+- Override writes (`setEntitlementOverride`, `removeEntitlementOverride`) join the transaction and roll back with it.
+- **Events fire before you commit.** The public `better-auth` entry exports no after-commit hook, so 0.1.0 emits an event when the adapter write returns. Inside a caller's transaction (an override write, or a sweep) an event can therefore announce a write that later rolls back. Emitting after commit is a follow-up.
 - The source's `resolve` receives the current adapter.
 
 ## Delivery guarantees
@@ -500,13 +564,13 @@ Every function and endpoint reads and writes through better-auth's `getCurrentAd
 - Deleting an organization through `/organization/delete` removes its usage rows, overrides and snapshot (`organizationCleanup`, on by default). For deletes made another way, call `deleteOrganizationData(auth, organizationId)`, for example:
 
   ```ts
-  organization({
-    organizationHooks: {
-      afterDeleteOrganization: async ({ organization }) => {
-        await deleteOrganizationData(auth, organization.id)
-      },
-    },
-  })
+  // lib/purge.ts (server only)
+  import { deleteOrganizationData } from "@byo-oss/entitlements"
+  import { auth } from "./auth"
+
+  export async function purgeOrganization(organizationId: string): Promise<void> {
+    await deleteOrganizationData(auth, organizationId)
+  }
   ```
 
 - With `organizationCleanup: false`, SQL adapters still cascade through the foreign keys; the memory adapter and MongoDB keep the rows until `deleteOrganizationData` runs.
@@ -547,14 +611,20 @@ Every function and endpoint reads and writes through better-auth's `getCurrentAd
 `exportEntitlementsData(auth, { organizationId?, cursor?, limit? })` returns snapshots, overrides (every status) and usage rows as plain JSON in the documented schema. Every row carries `organizationId`; overrides also carry `createdByEmail` and `removedByEmail`. `limit` is 1 to 1000 (default 100). A page holds rows of one model, in the order snapshots, overrides, usage; the other lists are empty.
 
 ```ts
+// scripts/export.ts (server only)
+import { writeFile } from "node:fs/promises"
 import { exportEntitlementsData } from "@byo-oss/entitlements"
+import { auth } from "../lib/auth"
 
-let cursor: string | null = null
-do {
-  const page = await exportEntitlementsData(auth, { organizationId, cursor })
-  await save(page.snapshots, page.overrides, page.usage)
-  cursor = page.nextCursor
-} while (cursor)
+export async function exportOrganization(organizationId: string): Promise<void> {
+  let cursor: string | null = null
+  let n = 0
+  do {
+    const page = await exportEntitlementsData(auth, { organizationId, cursor })
+    await writeFile(`entitlements-${n++}.json`, JSON.stringify(page))
+    cursor = page.nextCursor
+  } while (cursor)
+}
 ```
 
 Pages use an offset over `id` order, so a row deleted mid-export shifts later rows back and one of them can be missed; export from a quiet database. The catalog is not exported because it is your own code. A malformed cursor throws `[@byo-oss/entitlements] invalid export cursor`.
@@ -576,21 +646,83 @@ The staff list (`listEntitlementOverrides`) uses a keyset cursor instead and pag
 
 ## Community adapters
 
-A billing provider other than Stripe is a package named `byo-entitlements-<provider>` that exports a `BillingSource` (for example `byo-entitlements-polar`). The contract:
+A billing provider other than Stripe is a package named `byo-entitlements-<provider>` that exports a `BillingSource` (for example `byo-entitlements-polar`). Known adapters: none yet. The contract:
 
 - `id` is a non-empty string other than `"none"`; it is stored on snapshots.
 - `resolve(organizationId, { adapter })` returns the current `BillingState` or `null`, reads only through `ctx.adapter`, never mutates its inputs and throws to retry.
 - `connect(context, changed)`, if present, wires the provider's push. Call `await changed(organizationId)` after a change and let its rejection propagate, so the provider retries. `changed` has already logged it.
 - Moving from a paid state to `null`, or to a state without `periodEnd`, must end on `defaultPlan`.
 
-Run the contract suite (vitest, ESM) against it. `setup` builds a real better-auth with your source and an organization (the catalog needs a plan other than `defaultPlan`); `failing` builds one whose `resolve` always throws:
+Run the contract suite (vitest, ESM) against it. `setup` builds a real better-auth with your source and an organization (the catalog needs a plan other than `defaultPlan`); `failing` builds one whose `resolve` always throws. Replace the `Map` below with your provider's client:
 
 ```ts
+// src/source.test.ts
+import { betterAuth } from "better-auth"
+import { memoryAdapter } from "better-auth/adapters/memory"
+import { getAuthTables } from "better-auth/db"
+import { organization } from "better-auth/plugins/organization"
+import { entitlements, type BillingSource, type BillingState } from "@byo-oss/entitlements"
+import { defineEntitlements } from "@byo-oss/entitlements/catalog"
 import { testBillingSource } from "@byo-oss/entitlements/testing"
 
+const catalog = defineEntitlements({
+  features: ["exports"],
+  limits: { projects: { kind: "capacity" } },
+  plans: {
+    free: { features: { exports: false }, limits: { projects: 3 } },
+    pro: { features: { exports: true }, limits: { projects: "unlimited" } },
+  },
+  defaultPlan: "free",
+})
+
+// stands in for your package's source
+function createSource(states: Map<string, BillingState | null>, failing = false): BillingSource {
+  return {
+    id: "acme",
+    async resolve(organizationId) {
+      if (failing) throw new Error("provider is down")
+      const state = states.get(organizationId)
+      return state ? structuredClone(state) : null
+    },
+  }
+}
+
+async function build(source: BillingSource) {
+  const options = {
+    secret: "test_secret",
+    emailAndPassword: { enabled: true },
+    plugins: [organization(), entitlements({ catalog, source })],
+  }
+  // the memory adapter needs one empty array per table
+  const tables: Record<string, object[]> = {}
+  for (const table of Object.keys(getAuthTables(options))) tables[table] = []
+  const auth = betterAuth({ ...options, database: memoryAdapter(tables) })
+  const { user } = await auth.api.signUpEmail({
+    body: { email: "owner@acme.test", password: "test_secret", name: "Owner" },
+  })
+  const created = await auth.api.createOrganization({
+    body: { name: "Acme", slug: "acme", userId: user.id },
+  })
+  return { auth, organizationId: created.id }
+}
+
 testBillingSource({
-  setup: async () => ({ source, auth, organizationId, setState }),
-  failing: async () => ({ source: throwingSource, auth, organizationId }),
+  name: "acme source",
+  setup: async () => {
+    const states = new Map<string, BillingState | null>()
+    const source = createSource(states)
+    return {
+      source,
+      ...(await build(source)),
+      setState: async (organizationId, state) => {
+        states.set(organizationId, state)
+      },
+    }
+  },
+  failing: async () => {
+    const source = createSource(new Map(), true)
+    return { source, ...(await build(source)) }
+  },
 })
 ```
 

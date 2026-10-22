@@ -15,11 +15,37 @@ Work through these in order. Each step ends on a check; move on only when it hol
 
 1. **Catalog and plugin.** `npm install @byo-oss/entitlements` (use the repo's package manager). Write the catalog with `defineEntitlements` from `@byo-oss/entitlements/catalog`: `features` (booleans), `limits` (`metered` with a `period` of `day`, `month` or `billing`; `capacity`; `value`), `plans` that set every key, a `defaultPlan`, optional `planAliases`. Add `entitlements({ catalog, staffOrganizationId })` to `betterAuth({ plugins })` **after** `organization()`. With the Stripe plugin, add `source: fromBetterAuthStripe()` from `@byo-oss/entitlements/stripe` and build the Stripe plugin's `plans` with `stripePlans(catalog, { pro: { priceId } })`. Done when the app typechecks and boots; without `staffOrganizationId` the log warns that override endpoints will deny.
 
+   ```ts
+   // lib/catalog.ts
+   import { defineEntitlements } from "@byo-oss/entitlements/catalog"
+
+   export const catalog = defineEntitlements({
+     features: ["exports"],
+     limits: { apiCalls: { kind: "metered", period: "day" } },
+     plans: {
+       free: { features: { exports: false }, limits: { apiCalls: 1_000 } },
+       pro: { features: { exports: true }, limits: { apiCalls: 50_000 } },
+     },
+     defaultPlan: "free",
+   })
+   ```
+
 2. **Statements into `ac`.** Spread `entitlementsStatements` into `createAccessControl({ ...defaultStatements, ...entitlementsStatements })`, give roles `entitlements: ["read"]` (members) or `["read", "override"]` (owner, admin), and pass `ac` and `roles` to `organization()`. `override` is only ever checked in the staff organization, so a customer organization's owner cannot override their own plan. Done when the roles typecheck.
 
 3. **Migration.** Generate tables the way the repo already does: `npx @better-auth/cli migrate`, or `npx @better-auth/cli generate` and then the repo's drizzle or prisma flow. It adds `entitlementSnapshot`, `entitlementOverride` and `entitlementUsage`, with nothing on better-auth's own tables. On MongoDB, create unique indexes on `entitlementSnapshot.organizationId` and `entitlementUsage.bucket` first. Done when the migration is written and applied to the dev database.
 
 4. **Client plugin.** Add `entitlementsClient()` from `@byo-oss/entitlements/client` to `createAuthClient({ plugins })`, next to `organizationClient()`. Done when `authClient.entitlements.get` typechecks.
+
+   ```ts
+   // lib/auth-client.ts
+   import { createAuthClient } from "better-auth/react"
+   import { organizationClient } from "better-auth/client/plugins"
+   import { entitlementsClient } from "@byo-oss/entitlements/client"
+
+   export const authClient = createAuthClient({
+     plugins: [organizationClient(), entitlementsClient()],
+   })
+   ```
 
 5. **First `hasFeature` call.** In server code, `export const gate = createEntitlements(auth, catalog)`, then `await gate.hasFeature(organizationId, "exports")`. Done when a Free organization gets `{ allowed: false, reason: "not_in_plan", upgradeTo: ["pro"] }`.
 
@@ -30,26 +56,116 @@ Work through these in order. Each step ends on a check; move on only when it hol
 - **Check a count:** `await gate.checkCapacity(orgId, "members", { count })` before creating the row. The count is the app's; two concurrent creates can both pass, so lock the organization row in a transaction if that matters.
 - **Read a setting:** `await gate.getLimit(orgId, "retentionDays")`.
 - **After checkout:** call `refreshEntitlements` (`authClient.entitlements.refresh({ organizationId })`, or the hook's `refresh()`) when the user returns, because the webhook may arrive later.
-- **UI:** `useEntitlements({ client: authClient, organizationId })`, `<EntitlementGate entitlements feature fallback />` and `<UsageMeter entitlements limitKey />` from `@byo-oss/entitlements/react`. Tailwind v4 skips `node_modules`: add `@source "<relative path>/node_modules/@byo-oss/entitlements/dist";` to the CSS file that imports Tailwind.
-- **Cron:** with a `source`, call `auth.api.processEntitlementsSync()` every minute, and again while `hasMore` is true. Without the cron (and without `advanced.backgroundTasks.handler`), a stale snapshot is marked due but only a push or `refreshEntitlements` updates it.
+- **UI:** `useEntitlements`, `EntitlementGate` and `UsageMeter` from `@byo-oss/entitlements/react`. Tailwind v4 skips `node_modules`: add `@source "<relative path>/node_modules/@byo-oss/entitlements/dist";` to the CSS file that imports Tailwind.
+
+  ```tsx
+  // components/exports.tsx
+  import { EntitlementGate, UsageMeter, useEntitlements } from "@byo-oss/entitlements/react"
+  import { authClient } from "../lib/auth-client"
+  import { catalog } from "../lib/catalog"
+
+  export function Exports({ organizationId }: { organizationId: string }) {
+    const entitlements = useEntitlements<typeof catalog>({ client: authClient, organizationId })
+    return (
+      <>
+        <EntitlementGate
+          entitlements={entitlements}
+          feature="exports"
+          catalog={catalog}
+          fallback={({ upgradeTo }) => <a href="/billing">Upgrade to {upgradeTo[0]}</a>}
+        >
+          <button type="button">Export</button>
+        </EntitlementGate>
+        <UsageMeter entitlements={entitlements} limitKey="apiCalls" catalog={catalog} />
+      </>
+    )
+  }
+  ```
+- **Cron:** with a `source`, call `auth.api.processEntitlementsSync()` every minute, and again while `hasMore` is true. Without the cron (and without `advanced.backgroundTasks.handler`), a stale snapshot is marked due but only a push, `refreshEntitlements` or `gate.sync(orgId)` (which also refreshes a stale snapshot) updates it.
 
 ## Rules
 
 - Gate through `createEntitlements`. Leave the plugin's tables to it; use `auth.api.*`, the client, the React exports and the exported functions.
 - Every duration option is in milliseconds, except `pastDueGraceDays` (days). Floors: `maxAge` 60000, `usageRetention` and `overrideRetention` 86400000. A value in the wrong unit fails boot.
-- `consumeUsage`, `sync` and `refreshEntitlements` throw inside a transaction; call them outside. Reads and `checkCapacity` work inside one.
+- `consumeUsage`, `sync(orgId)` and `refreshEntitlements` throw inside a transaction; call them outside. Reads and `checkCapacity` work inside one, and the sweep (`processEntitlementsSync`, `byo.sweep`) joins it. Events fire when the adapter write returns (the public `better-auth` entry has no after-commit hook), so inside a transaction one can announce a write that rolls back.
 - Never rename a plan key that has subscribers; map the old key with `planAliases`.
-- A custom `acceptSession` replaces the default, so keep the rule that refuses impersonated sessions (`session.session.impersonatedBy`) on staff calls and POSTs.
+- The default `acceptSession` refuses impersonated sessions (`session.session.impersonatedBy`) on staff calls and POSTs, and nothing else. Refusing API-key or bearer sessions on the override endpoints is an app choice; a custom `acceptSession` replaces the default, so it keeps the impersonation rule and adds its own.
 - Deleting an organization through `/organization/delete` cleans up by itself. Deletes made another way call `deleteOrganizationData(auth, organizationId)`.
-- Route `entitlements.usage.limit_reached` from `onEvent` to `auth.api.notify` when the app uses `@byo-oss/notifications`.
+- Route `entitlements.usage.limit_reached` from `onEvent` to `auth.api.notify` when the app uses `@byo-oss/notifications`. `notify` exists only with its `inbox()` plugin installed; pass the event's `type` as the notification `type`. The README has the full sample.
 
 ## Another billing provider
 
-A provider other than Stripe is a `BillingSource` (`id`, `resolve(organizationId, { adapter })`, optional `connect`): resolve returns the current state or `null`, and throws to retry. Name the package `byo-entitlements-<provider>` and test it with the contract suite (vitest, ESM):
+A provider other than Stripe is a `BillingSource` (`id`, `resolve(organizationId, { adapter })`, optional `connect`): resolve returns the current state or `null`, and throws to retry. Name the package `byo-entitlements-<provider>` and test it with the contract suite (vitest, ESM). Replace the `Map` with the provider's client:
 
 ```ts
+// src/source.test.ts
+import { betterAuth } from "better-auth"
+import { memoryAdapter } from "better-auth/adapters/memory"
+import { getAuthTables } from "better-auth/db"
+import { organization } from "better-auth/plugins/organization"
+import { entitlements, type BillingSource, type BillingState } from "@byo-oss/entitlements"
+import { defineEntitlements } from "@byo-oss/entitlements/catalog"
 import { testBillingSource } from "@byo-oss/entitlements/testing"
-testBillingSource({ setup, failing })
+
+const catalog = defineEntitlements({
+  features: ["exports"],
+  limits: { projects: { kind: "capacity" } },
+  plans: {
+    free: { features: { exports: false }, limits: { projects: 3 } },
+    pro: { features: { exports: true }, limits: { projects: "unlimited" } },
+  },
+  defaultPlan: "free",
+})
+
+// stands in for your package's source
+function createSource(states: Map<string, BillingState | null>, failing = false): BillingSource {
+  return {
+    id: "acme",
+    async resolve(organizationId) {
+      if (failing) throw new Error("provider is down")
+      const state = states.get(organizationId)
+      return state ? structuredClone(state) : null
+    },
+  }
+}
+
+async function build(source: BillingSource) {
+  const options = {
+    secret: "test_secret",
+    emailAndPassword: { enabled: true },
+    plugins: [organization(), entitlements({ catalog, source })],
+  }
+  // the memory adapter needs one empty array per table
+  const tables: Record<string, object[]> = {}
+  for (const table of Object.keys(getAuthTables(options))) tables[table] = []
+  const auth = betterAuth({ ...options, database: memoryAdapter(tables) })
+  const { user } = await auth.api.signUpEmail({
+    body: { email: "owner@acme.test", password: "test_secret", name: "Owner" },
+  })
+  const created = await auth.api.createOrganization({
+    body: { name: "Acme", slug: "acme", userId: user.id },
+  })
+  return { auth, organizationId: created.id }
+}
+
+testBillingSource({
+  name: "acme source",
+  setup: async () => {
+    const states = new Map<string, BillingState | null>()
+    const source = createSource(states)
+    return {
+      source,
+      ...(await build(source)),
+      setState: async (organizationId, state) => {
+        states.set(organizationId, state)
+      },
+    }
+  },
+  failing: async () => {
+    const source = createSource(new Map(), true)
+    return { source, ...(await build(source)) }
+  },
+})
 ```
 
 Done when the suite passes.
