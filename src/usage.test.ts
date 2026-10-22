@@ -836,7 +836,9 @@ describe("upgradeTo never names the current plan (PRD A5(b))", () => {
     const api = createEntitlements(auth, testCatalog);
     const allowed = await api.consumeUsage(organizationId, "apiCalls");
     expect(allowed).toMatchObject({ allowed: true, used: 1, plan: "pro" });
-    expect(allowed.upgradeTo).not.toContain("pro");
+    // only plans above pro's catalog 50000: free's 1000 covers used + 1 but
+    // is no upgrade (RC review 2 NB5)
+    expect(allowed.upgradeTo).toEqual(["team"]);
     const refused = await api.consumeUsage(organizationId, "apiCalls", {
       amount: 2_000,
     });
@@ -850,7 +852,134 @@ describe("upgradeTo never names the current plan (PRD A5(b))", () => {
     expect(refused.upgradeTo).toEqual(["team"]);
     const limit = await api.getLimit(organizationId, "apiCalls");
     expect(limit).toMatchObject({ allowed: false, reason: "limit_reached" });
-    expect(limit.upgradeTo).not.toContain("pro");
+    expect(limit.upgradeTo).toEqual(["team"]);
+  });
+});
+
+describe("upgradeTo lists only plans strictly better on that key (RC review 2 NB5)", () => {
+  /** An organization on `planKey` (billed), with optional live overrides. */
+  async function orgOn(
+    planKey: string,
+    overrides: {
+      kind: "feature" | "limit";
+      key: string;
+      value: unknown;
+    }[] = [],
+  ) {
+    const source = fakeSource();
+    const auth = makeAuth({ options: { source, cacheTtlMs: 0 } });
+    const { organizationId } = await seedOrg(auth);
+    source.states.set(organizationId, { planKey, status: "active" });
+    for (const override of overrides) {
+      await seedOverride(auth, {
+        organizationId,
+        ...override,
+        value: override.value as LimitValue | boolean,
+      });
+    }
+    return { organizationId, api: createEntitlements(auth, testCatalog) };
+  }
+
+  it("a Pro org with a staff apiCalls override of 1: getLimit and consumeUsage leave out free (below pro's catalog limit)", async () => {
+    const { organizationId, api } = await orgOn("pro", [
+      { kind: "limit", key: "apiCalls", value: 1 },
+    ]);
+    const before = await api.getLimit(organizationId, "apiCalls");
+    expect(before).toMatchObject({ allowed: true, limit: 1, used: 0 });
+    expect(before.upgradeTo).toEqual(["team"]);
+    const consumed = await api.consumeUsage(organizationId, "apiCalls");
+    expect(consumed.upgradeTo).toEqual(["team"]);
+    const refused = await api.consumeUsage(organizationId, "apiCalls");
+    expect(refused).toMatchObject({ allowed: false, reason: "limit_reached" });
+    expect(refused.upgradeTo).toEqual(["team"]);
+    const after = await api.getLimit(organizationId, "apiCalls");
+    expect(after).toMatchObject({ allowed: false, remaining: 0 });
+    expect(after.upgradeTo).toEqual(["team"]);
+  });
+
+  it("capacity and value keys: only plans above the current plan's catalog value", async () => {
+    const { organizationId, api } = await orgOn("pro", [
+      { kind: "limit", key: "members", value: 3 },
+    ]);
+    // members: free 5, pro 50, team 500. Needed 4 alone would list free.
+    const refused = await api.checkCapacity(organizationId, "members", {
+      count: 3,
+    });
+    expect(refused).toMatchObject({ allowed: false, reason: "limit_reached" });
+    expect(refused.upgradeTo).toEqual(["team"]);
+    expect((await api.getLimit(organizationId, "members")).upgradeTo).toEqual([
+      "team",
+    ]);
+    // retentionDays: free 7, pro 90, team 365
+    expect(
+      (await api.getLimit(organizationId, "retentionDays")).upgradeTo,
+    ).toEqual(["team"]);
+  });
+
+  it("a current plan with an unlimited catalog value answers [] for that key", async () => {
+    const pro = await orgOn("pro", [
+      { kind: "limit", key: "projects", value: 2 },
+    ]);
+    const projects = await pro.api.checkCapacity(
+      pro.organizationId,
+      "projects",
+      { count: 2 },
+    );
+    expect(projects).toMatchObject({ allowed: false, limit: 2 });
+    expect(projects.upgradeTo).toEqual([]);
+    expect(
+      (await pro.api.getLimit(pro.organizationId, "projects")).upgradeTo,
+    ).toEqual([]);
+
+    const team = await orgOn("team", [
+      { kind: "limit", key: "apiCalls", value: 1 },
+    ]);
+    await team.api.consumeUsage(team.organizationId, "apiCalls");
+    const refused = await team.api.consumeUsage(
+      team.organizationId,
+      "apiCalls",
+    );
+    expect(refused).toMatchObject({ allowed: false, reason: "limit_reached" });
+    expect(refused.upgradeTo).toEqual([]);
+    expect(
+      (await team.api.getLimit(team.organizationId, "apiCalls")).upgradeTo,
+    ).toEqual([]);
+  });
+
+  it("the amount needed wins when it is above the current plan's catalog value", async () => {
+    const { organizationId, api } = await orgOn("free");
+    // free 1000, pro 50000: 60000 at once only fits team
+    const refused = await api.consumeUsage(organizationId, "apiCalls", {
+      amount: 60_000,
+    });
+    expect(refused).toMatchObject({ allowed: false, reason: "limit_reached" });
+    expect(refused.upgradeTo).toEqual(["team"]);
+    const capacity = await api.checkCapacity(organizationId, "members", {
+      count: 40,
+      adding: 20,
+    });
+    expect(capacity.upgradeTo).toEqual(["team"]);
+    const fits = await api.checkCapacity(organizationId, "members", {
+      count: 4,
+    });
+    expect(fits).toMatchObject({ allowed: true });
+    expect(fits.upgradeTo).toEqual(["pro", "team"]);
+  });
+
+  it("features: the plans with the feature, the current plan left out", async () => {
+    const pro = await orgOn("pro");
+    expect(
+      (await pro.api.hasFeature(pro.organizationId, "sso")).upgradeTo,
+    ).toEqual(["team"]);
+    expect(
+      (await pro.api.hasFeature(pro.organizationId, "exports")).upgradeTo,
+    ).toEqual(["team"]);
+    const team = await orgOn("team", [
+      { kind: "feature", key: "sso", value: false },
+    ]);
+    const refused = await team.api.hasFeature(team.organizationId, "sso");
+    expect(refused).toMatchObject({ allowed: false, reason: "not_in_plan" });
+    expect(refused.upgradeTo).toEqual([]);
   });
 });
 

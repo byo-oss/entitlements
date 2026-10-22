@@ -10,8 +10,9 @@ const isCount = (value: unknown): value is number =>
 /**
  * `checkCapacity` (capacity keys only): `allowed = count + adding <= limit`
  * (`"unlimited"` always allows), `over = count > limit`, `reason`
- * `"limit_reached"` when refused, with `upgradeTo` for `count + adding`
- * (never the current plan, PRD A5(b)). A 0 limit means "not included"
+ * `"limit_reached"` when refused, with `upgradeTo` for `count + adding`:
+ * only plans above the current plan's catalog value for the key, never the
+ * current plan (PRD A5(b), `upgradeFrom`). A 0 limit means "not included"
  * (A5(c)): always refused with `reason: "not_in_plan"`, `{ count: 0,
  * adding: 0 }` included. `adding` defaults to 1; `count` and `adding` are
  * non-negative integers (else it throws). Works inside a transaction. A

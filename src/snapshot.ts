@@ -130,6 +130,16 @@ function syncFields(rt: EntitlementsRuntime, now: Date) {
   };
 }
 
+/**
+ * A snapshot write and the organization's cache generation taken right
+ * after the write's own cache clear, before `plan.changed` is emitted
+ * (`generation` is null when nothing was written).
+ */
+export type TrackedSnapshotWrite = {
+  row: EntitlementSnapshotRow | null;
+  generation: number | null;
+};
+
 /** The version-guarded in-place write of `writeSnapshot`. */
 async function updateSnapshot(
   rt: EntitlementsRuntime,
@@ -137,7 +147,7 @@ async function updateSnapshot(
   state: BillingState | null,
   previous: EntitlementSnapshotRow,
   adapter: DBTransactionAdapter,
-): Promise<EntitlementSnapshotRow | null> {
+): Promise<TrackedSnapshotWrite> {
   const now = rt.now();
   const row = await adapter.incrementOne<EntitlementSnapshotRow>({
     model: MODEL,
@@ -156,9 +166,10 @@ async function updateSnapshot(
     },
   });
   rt.cache.delete(organizationId);
-  if (!row) return null;
+  if (!row) return { row: null, generation: null };
+  const generation = rt.cache.generation(organizationId);
   await notifyPlanChange(rt, organizationId, previous, row);
-  return row;
+  return { row, generation };
 }
 
 /**
@@ -191,6 +202,25 @@ export async function writeSnapshot(
     adapter: DBTransactionAdapter;
   },
 ): Promise<EntitlementSnapshotRow | null> {
+  return (await writeSnapshotTracked(rt, organizationId, state, opts)).row;
+}
+
+/**
+ * `writeSnapshot`, also answering the organization's cache generation taken
+ * synchronously after the write's own cache clear and before its
+ * `plan.changed` event (null when nothing was written). A read-through
+ * caches against it: a write that lands while the event handler runs
+ * moves it on, so the read-through's (then older) state isn't cached.
+ */
+export async function writeSnapshotTracked(
+  rt: EntitlementsRuntime,
+  organizationId: string,
+  state: BillingState | null,
+  opts: {
+    previous: EntitlementSnapshotRow | null;
+    adapter: DBTransactionAdapter;
+  },
+): Promise<TrackedSnapshotWrite> {
   const { previous, adapter } = opts;
   if (previous) {
     return updateSnapshot(rt, organizationId, state, previous, adapter);
@@ -200,19 +230,20 @@ export async function writeSnapshot(
     mine = true;
     return createSnapshot(rt, organizationId, state, adapter);
   });
-  return mine ? created : null;
+  return mine ? created : { row: null, generation: null };
 }
 
-/** The create flight of `writeSnapshot`: null when a row already exists. */
+/** The create flight of `writeSnapshot`: no row when a row already exists. */
 async function createSnapshot(
   rt: EntitlementsRuntime,
   organizationId: string,
   state: BillingState | null,
   adapter: DBTransactionAdapter,
-): Promise<EntitlementSnapshotRow | null> {
+): Promise<TrackedSnapshotWrite> {
+  const none = { row: null, generation: null };
   // written by another caller after this one's read: its state may be
   // newer than this one, so it stays
-  if (await readSnapshot(rt, adapter, organizationId)) return null;
+  if (await readSnapshot(rt, adapter, organizationId)) return none;
   const now = rt.now();
   let row: EntitlementSnapshotRow;
   try {
@@ -235,12 +266,13 @@ async function createSnapshot(
     });
   } catch (error) {
     // another process won the unique organizationId: its row stays
-    if (await readSnapshot(rt, adapter, organizationId)) return null;
+    if (await readSnapshot(rt, adapter, organizationId)) return none;
     throw error;
   }
   rt.cache.delete(organizationId);
+  const generation = rt.cache.generation(organizationId);
   await notifyPlanChange(rt, organizationId, null, row);
-  return row;
+  return { row, generation };
 }
 
 /**

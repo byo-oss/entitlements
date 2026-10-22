@@ -69,34 +69,37 @@ export interface BillingSource {
 /** Where the resolved plan came from. */
 export type PlanSource = "billing" | "default" | "override";
 
-/** A live override as resolution reports it (no reason, no author). */
+/** A live override as resolution reports it (no reason, no author). Read-only. */
 export type AppliedOverride = {
-  kind: OverrideKind;
-  key: string;
-  expiresAt: Date | null;
+  readonly kind: OverrideKind;
+  readonly key: string;
+  readonly expiresAt: Date | null;
 };
 
 /**
- * What `get` returns for one organization. Read-only: a result served from
- * (or stored in) the cache is deep-frozen and shared between callers, so
- * copy it before changing anything.
+ * What `get` returns for one organization. Read-only, in its type (every
+ * field, record and array is `readonly`) and at runtime for a cacheable
+ * result: the cache stores a deep-frozen copy, and every caller gets those
+ * frozen objects with its own copies of the `Date`s (so `setDate` on one
+ * caller's `periodEnd` changes nothing else). Copy it before changing
+ * anything.
  */
 export type EntitlementsResult<C extends AnyCatalog = AnyCatalog> = {
-  organizationId: string;
+  readonly organizationId: string;
   /** True when the database or the source failed and this is `defaultPlan`. */
-  degraded: boolean;
-  plan: {
-    key: PlanKey<C>;
-    display: Record<string, unknown>;
-    source: PlanSource;
+  readonly degraded: boolean;
+  readonly plan: {
+    readonly key: PlanKey<C>;
+    readonly display: Readonly<Record<string, unknown>>;
+    readonly source: PlanSource;
   };
   /** The snapshot's provider status (null without a subscription). */
-  status: string | null;
-  periodEnd: Date | null;
-  cancelAtPeriodEnd: boolean;
-  features: Record<FeatureKey<C>, boolean>;
-  limits: Record<LimitKey<C>, LimitValue>;
-  overrides: AppliedOverride[];
+  readonly status: string | null;
+  readonly periodEnd: Date | null;
+  readonly cancelAtPeriodEnd: boolean;
+  readonly features: Readonly<Record<FeatureKey<C>, boolean>>;
+  readonly limits: Readonly<Record<LimitKey<C>, LimitValue>>;
+  readonly overrides: readonly AppliedOverride[];
 };
 
 /**
@@ -105,7 +108,8 @@ export type EntitlementsResult<C extends AnyCatalog = AnyCatalog> = {
  * (false without a snapshot), whether the id is an organization and, for a
  * degraded one, the error. What the cache stores (never a degraded state,
  * never an unknown id). A cached state, and the result returned from it, is
- * deep-frozen: results are read-only.
+ * deep-frozen, with fresh copies of its `Date`s for each caller: results
+ * are read-only.
  */
 export type ResolvedState<C extends AnyCatalog = AnyCatalog> = {
   result: EntitlementsResult<C>;
@@ -132,15 +136,23 @@ export type ResolvedState<C extends AnyCatalog = AnyCatalog> = {
 
 export type CheckReason = "ok" | "not_in_plan" | "limit_reached" | "error";
 
-/** Fields every check result carries. */
+/**
+ * Fields every check result carries. Check results are read-only in their
+ * type (each call builds a new one).
+ */
 export type CheckResultBase<C extends AnyCatalog, K extends string> = {
-  allowed: boolean;
-  reason: CheckReason;
-  key: K;
+  readonly allowed: boolean;
+  readonly reason: CheckReason;
+  readonly key: K;
   /** The organization's resolved plan key. */
-  plan: PlanKey<C>;
-  /** Plans that would allow it, in catalog order (`upgradeTo`). */
-  upgradeTo: PlanKey<C>[];
+  readonly plan: PlanKey<C>;
+  /**
+   * Plans that would allow it, in catalog order: only plans strictly better
+   * on that key than the current plan (a feature: the plans that include
+   * it; a limit: above the current plan's catalog value and at least what
+   * is needed), never the current plan. `[]` on a degraded answer.
+   */
+  readonly upgradeTo: readonly PlanKey<C>[];
 };
 
 /** `hasFeature`. */
@@ -151,10 +163,10 @@ export type FeatureCheckResult<
 
 /** A metered key's counter for the current period. */
 export type UsageInfo = {
-  used: number;
-  remaining: number | "unlimited";
+  readonly used: number;
+  readonly remaining: number | "unlimited";
   /** When the current period ends (the counter resets). */
-  resetAt: Date;
+  readonly resetAt: Date;
 };
 
 /** `getLimit` on a capacity or value key. */
@@ -162,9 +174,9 @@ export type LimitResult<
   C extends AnyCatalog = AnyCatalog,
   K extends string = LimitKey<C>,
 > = CheckResultBase<C, K> & {
-  limit: LimitValue;
+  readonly limit: LimitValue;
   /** True when this answer is `defaultPlan` because of a failure. */
-  degraded: boolean;
+  readonly degraded: boolean;
 };
 
 /** `getLimit` on a metered key: the limit plus the counter (read, not consumed). */
@@ -179,9 +191,9 @@ export type ConsumeResult<
   K extends string = MeteredKey<C>,
 > = CheckResultBase<C, K> &
   UsageInfo & {
-    limit: LimitValue;
+    readonly limit: LimitValue;
     /** True for the first refusal of this key in this period. */
-    firstRefusal: boolean;
+    readonly firstRefusal: boolean;
   };
 
 /** `checkCapacity`. */
@@ -189,10 +201,10 @@ export type CapacityResult<
   C extends AnyCatalog = AnyCatalog,
   K extends string = LimitKey<C>,
 > = CheckResultBase<C, K> & {
-  count: number;
-  limit: LimitValue;
+  readonly count: number;
+  readonly limit: LimitValue;
   /** `count > limit`: already above the limit (e.g. after a downgrade). */
-  over: boolean;
+  readonly over: boolean;
 };
 
 // ---------------------------------------------------------------------------

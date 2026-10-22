@@ -320,6 +320,68 @@ describe("two concurrent pushes (RC review 1 #1)", () => {
   });
 });
 
+describe("sweep vs sweep after a lease expiry (RC review 2 NB1)", () => {
+  it("sweep A's lease runs out, sweep B claims the row; A's lost write leaves B's claim in place and B's write lands", async () => {
+    const a = await setup();
+    const b = await secondProcess(a);
+    const { organizationId } = await dueOrg(a, "pro");
+    const startedAt = new Date();
+    a.rt.now = () => startedAt;
+    // sweep A claims at startedAt, resolves "pro" and is held
+    const aHold = a.holds.at(1);
+    const sweepA = runSync(a.rt);
+    await aHold.reached;
+    const claimA = await snapshotOf(a, organizationId);
+    expect(claimA?.syncState).toBe("syncing");
+    expect(new Date(claimA?.syncClaimedAt as Date).getTime()).toBe(
+      startedAt.getTime(),
+    );
+
+    // A's lease runs out: sweep B (another process) releases the stale
+    // claim, claims the row again, resolves "team" and is held
+    const later = new Date(startedAt.getTime() + a.rt.options.leaseMs + MINUTE);
+    b.rt.now = () => later;
+    b.source.states.set(organizationId, active("team"));
+    const bHold = b.holds.at(1);
+    const sweepB = runSync(b.rt);
+    await bHold.reached;
+    const claimB = await snapshotOf(a, organizationId);
+    expect(claimB?.syncState).toBe("syncing");
+    expect(new Date(claimB?.syncClaimedAt as Date).getTime()).toBe(
+      later.getTime(),
+    );
+
+    // A's write loses the version guard; its release must not free B's claim
+    aHold.release();
+    expect(await sweepA).toMatchObject({ synced: 1, retrying: 0, failed: 0 });
+    const afterA = await snapshotOf(a, organizationId);
+    expect(afterA).toMatchObject({
+      planKey: "pro",
+      syncState: "syncing",
+      version: claimB?.version,
+    });
+    expect(new Date(afterA?.syncClaimedAt as Date).getTime()).toBe(
+      later.getTime(),
+    );
+
+    // B's write lands
+    bHold.release();
+    expect(await sweepB).toMatchObject({ synced: 1, retrying: 0, failed: 0 });
+    expect(await snapshotOf(a, organizationId)).toMatchObject({
+      planKey: "team",
+      syncState: "idle",
+      syncClaimedAt: null,
+      syncAttempts: 0,
+      version: (claimB?.version ?? 0) + 1,
+    });
+    expect(planChanges(b.onEvent)).toEqual([
+      { from: "pro", to: "team", status: "active" },
+    ]);
+    expect(a.error).not.toHaveBeenCalled();
+    expect(b.error).not.toHaveBeenCalled();
+  });
+});
+
 describe("the create-conflict path never overwrites a newer row (RC review 1 #1)", () => {
   it("a create that loses the unique organizationId to another process returns null and leaves that row", async () => {
     const a = await setup();

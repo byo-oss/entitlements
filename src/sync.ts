@@ -71,8 +71,9 @@ function take<T>(budget: Budget, rows: T[]): T[] {
  *    (already incremented) `version` (`toSnapshotFields`, `plan.changed`
  *    through `notifyPlanChange`), then the organization's cache entry is
  *    cleared. A lost version guard means a push, a refresh or another sweep
- *    wrote or claimed the row meanwhile: the claim is released and the row
- *    counts as `synced`.
+ *    wrote or claimed the row meanwhile: the claim is released (only while
+ *    the row is still `syncing` with this sweep's own `syncClaimedAt`, so a
+ *    second sweep's live claim stays) and the row counts as `synced`.
  *
  *    Why the claim moves `version`: every state write is guarded on the
  *    version its writer read before calling `source.resolve`, so a write
@@ -219,6 +220,9 @@ async function syncOne(
   });
   if (!claimed) return "skipped";
   const { organizationId } = claimed;
+  // this sweep's own claim time (what the claim wrote): a release is
+  // guarded on it
+  const claimedAt = now;
   try {
     const state = await source.resolve(organizationId, { adapter });
     // guarded on the claimed version; sets syncState idle and the sync
@@ -229,24 +233,33 @@ async function syncOne(
     });
     rt.cache.delete(organizationId);
     // null: a push stored newer state meanwhile, which stays
-    if (!written) await release(rt, adapter, claimed);
+    if (!written) await release(rt, adapter, claimed, claimedAt);
     return "synced";
   } catch (error) {
-    return retryOrFail(rt, adapter, claimed, error);
+    return retryOrFail(rt, adapter, claimed, claimedAt, error);
   }
 }
 
-/** Gives back a claim whose row another write already moved on. */
+/**
+ * Gives back a claim whose row another write already moved on, only while
+ * the row is still `syncing` under this sweep's own claim (`syncClaimedAt`
+ * equal to `claimedAt`): after this sweep's lease ran out, another sweep
+ * may have released and re-claimed the row, and its live claim stays.
+ * The equality is written as `gte` and `lte` on the same instant.
+ */
 async function release(
   rt: EntitlementsRuntime,
   adapter: DBTransactionAdapter,
   claimed: EntitlementSnapshotRow,
+  claimedAt: Date,
 ): Promise<void> {
   await adapter.incrementOne<EntitlementSnapshotRow>({
     model: SNAPSHOT,
     where: [
       { field: "id", value: claimed.id },
       { field: "syncState", value: "syncing" },
+      { field: "syncClaimedAt", operator: "gte", value: claimedAt },
+      { field: "syncClaimedAt", operator: "lte", value: claimedAt },
     ],
     increment: {},
     set: { syncState: "idle", syncClaimedAt: null, updatedAt: rt.now() },
@@ -258,6 +271,7 @@ async function retryOrFail(
   rt: EntitlementsRuntime,
   adapter: DBTransactionAdapter,
   claimed: EntitlementSnapshotRow,
+  claimedAt: Date,
   error: unknown,
 ): Promise<Outcome> {
   const { maxAttempts, maxAge } = rt.options;
@@ -286,8 +300,9 @@ async function retryOrFail(
         updatedAt: now,
       },
     });
-    // a push wrote newer state meanwhile: keep its schedule, drop the claim
-    if (!updated) await release(rt, adapter, claimed);
+    // a push wrote newer state meanwhile: keep its schedule, drop the
+    // claim if it is still this sweep's
+    if (!updated) await release(rt, adapter, claimed, claimedAt);
   } catch (writeError) {
     // the claim stays; the lease releases it
     rt.logger.error(

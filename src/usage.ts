@@ -79,16 +79,46 @@ const remainingOf = (limit: LimitValue, used: number): number | "unlimited" =>
   limit === "unlimited" ? "unlimited" : Math.max(0, limit - used);
 
 /**
- * `upgradeTo` for a check result: the catalog's answer without the
- * organization's current plan (PRD A5(b)), which can match when an override
- * or the hook lowered a limit or turned a feature off.
+ * `upgradeTo` for a check result: only plans strictly better on that key
+ * than the organization's current plan (PRD A5(b), RC review 2 NB5).
+ * - A feature: the plans that include it, without the current plan (which
+ *   can include it when an override or the hook turned it off).
+ * - A limit: the plans whose catalog value is `"unlimited"` or at least
+ *   `max(atLeast, current + 1)`, where `current` is the current plan's
+ *   catalog value for the key, so a plan below it (e.g. `free` for a Pro
+ *   organization whose limit an override lowered) is never named. A
+ *   current catalog value of `"unlimited"` answers `[]`.
  */
 export function upgradeFrom(
   rt: EntitlementsRuntime,
   plan: string,
   target: UpgradeTarget<AnyCatalog>,
 ): string[] {
-  return upgradeTo(rt.catalog, target).filter((key) => key !== plan);
+  let wanted = target;
+  if ("limit" in target) {
+    const current = catalogLimit(rt, plan, target.limit);
+    if (current === "unlimited") return [];
+    if (typeof current === "number") {
+      wanted = {
+        limit: target.limit,
+        atLeast: Math.max(target.atLeast, current + 1),
+      };
+    }
+  }
+  return upgradeTo(rt.catalog, wanted).filter((key) => key !== plan);
+}
+
+/** A plan's own catalog value for a limit (before overrides and the hook). */
+function catalogLimit(
+  rt: EntitlementsRuntime,
+  plan: string,
+  key: string,
+): LimitValue | undefined {
+  const plans = rt.catalog.plans as Record<
+    string,
+    { limits: Record<string, LimitValue> } | undefined
+  >;
+  return plans[plan]?.limits[key];
 }
 
 const limitUpgrade = (
@@ -162,7 +192,8 @@ async function ensureBucket(
  * first refusal per period emits `entitlements.usage.limit_reached`. A
  * refusal answers `reason: "limit_reached"`, or `"not_in_plan"` when the
  * limit is 0 (PRD A5(c); it still counts toward `refused` and emits).
- * `upgradeTo` never names the current plan (A5(b)).
+ * `upgradeTo` lists only plans above the current plan's catalog value for
+ * the key, never the current plan (A5(b), `upgradeFrom`).
  * An id that isn't an organization (`state.known` false, or no
  * `organization` row when the bucket would be created) answers
  * `{ allowed: false, reason: "not_in_plan", upgradeTo: [] }` and writes
@@ -370,7 +401,8 @@ function limitVerdict(
  * get `{ used, remaining, resetAt }` (`readUsage`; no bucket is created).
  * `allowed`/`reason`: `"not_in_plan"` when the limit is 0, metered keys
  * `"limit_reached"` when `remaining` is 0, else `"ok"`; `upgradeTo` lists
- * the plans with at least 1 (metered: `used + 1`), never the current one. A failure answers
+ * the plans with at least 1 (metered: `used + 1`) and more than the current
+ * plan's catalog value, never the current one (`upgradeFrom`). A failure answers
  * `defaultPlan` with `degraded: true`, `allowed: false` and
  * `reason: "error"`: a degraded `resolveState` is not logged again (the read
  * logged it); a `readUsage` throw is logged once here.
@@ -461,7 +493,7 @@ export async function getLimit(
 /**
  * `hasFeature`: `allowed` = the resolved feature value; `reason`
  * `"not_in_plan"` when false; `upgradeTo` lists the plans with the feature,
- * never the current one.
+ * never the current one (`upgradeFrom`).
  * A degraded `resolveState` answers `rt.options.onError(state.error, {
  * organizationId, key, operation: "hasFeature" })` with `reason: "error"`
  * and doesn't log again (the read logged it). Throws `UNKNOWN_KEY` for a key

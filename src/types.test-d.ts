@@ -175,7 +175,7 @@ export async function callSites(organizationId: string) {
   assertType<Equal<keyof typeof result.features, "exports" | "sso">>();
   const feature = await entitlements.hasFeature(organizationId, "exports");
   assertType<Equal<typeof feature.key, "exports">>();
-  assertType<Equal<typeof feature.upgradeTo, ("free" | "pro")[]>>();
+  assertType<Equal<typeof feature.upgradeTo, readonly ("free" | "pro")[]>>();
   const consumed = await entitlements.consumeUsage(organizationId, "apiCalls", {
     amount: 2,
   });
@@ -208,6 +208,67 @@ export async function callSites(organizationId: string) {
   await entitlements.getLimit(organizationId, "nope");
   // @ts-expect-error upgradeTo with an unknown feature
   upgradeTo(catalog, { feature: "nope" });
+}
+
+// results are read-only in their types (RC review 2 NB4): every field,
+// record and array, on get and on every check
+export async function readonlyResults(organizationId: string) {
+  const entitlements = createEntitlements(auth, catalog);
+  const result = await entitlements.get(organizationId);
+  // @ts-expect-error a result field is read-only
+  result.degraded = true;
+  // @ts-expect-error the plan is read-only
+  result.plan.key = "pro";
+  // @ts-expect-error features are read-only
+  result.features.sso = true;
+  // @ts-expect-error limits are read-only
+  result.limits.apiCalls = "unlimited";
+  // @ts-expect-error the overrides array is read-only
+  result.overrides.push({ kind: "feature", key: "sso", expiresAt: null });
+  const [first] = result.overrides;
+  if (first) {
+    // @ts-expect-error an applied override is read-only
+    first.expiresAt = null;
+  }
+  // a Date stays a Date (each call gets its own copy)
+  assertType<Equal<typeof result.periodEnd, Date | null>>();
+  const [many] = await entitlements.getMany([organizationId]);
+  if (many) {
+    // @ts-expect-error getMany's results are read-only too
+    many.status = null;
+  }
+
+  const feature = await entitlements.hasFeature(organizationId, "exports");
+  // @ts-expect-error a check result field is read-only
+  feature.allowed = true;
+  // @ts-expect-error upgradeTo is a read-only array
+  feature.upgradeTo.push("pro");
+  const metered = await entitlements.getLimit(organizationId, "apiCalls");
+  // @ts-expect-error a metered getLimit's counter is read-only
+  metered.used = 0;
+  const value = await entitlements.getLimit(organizationId, "retentionDays");
+  // @ts-expect-error a getLimit result is read-only
+  value.limit = 1;
+  const consumed = await entitlements.consumeUsage(organizationId, "apiCalls");
+  // @ts-expect-error a consumeUsage result is read-only
+  consumed.firstRefusal = false;
+  // @ts-expect-error resetAt can't be replaced
+  consumed.resetAt = new Date();
+  const capacity = await entitlements.checkCapacity(organizationId, "members", {
+    count: 1,
+  });
+  // @ts-expect-error a checkCapacity result is read-only
+  capacity.over = false;
+  // @ts-expect-error its upgradeTo can't be sorted in place
+  capacity.upgradeTo.sort();
+
+  // reading, spreading and copying still work
+  const plans: readonly string[] = feature.upgradeTo;
+  const copy = [...capacity.upgradeTo];
+  copy.push("pro");
+  const edited = { ...result, degraded: true };
+  edited.degraded = false;
+  void plans;
 }
 
 // members get { kind, key, expiresAt }; id, reason and createdBy are staff-only

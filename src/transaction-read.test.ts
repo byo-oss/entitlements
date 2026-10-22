@@ -115,7 +115,8 @@ describe("reads inside a transaction (PRD #15, N03 half, memory)", () => {
     }));
     expect(inside.cached.plan.key).toBe("pro");
     expect(inside.fresh.result.plan.key).toBe("team");
-    expect(rt.cache.get(organizationId)).toBe(cached);
+    // still the state cached before (each get hands back fresh Dates)
+    expect(rt.cache.get(organizationId)).toEqual(cached);
   });
 
   it("an unknown organization answers defaultPlan without calling the source", async () => {

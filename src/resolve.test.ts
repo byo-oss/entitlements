@@ -29,7 +29,7 @@ import {
   type TestAuthConfig,
   testCatalog,
 } from "./test-utils";
-import type { BillingState, ResolvedState } from "./types";
+import type { AppliedOverride, BillingState, ResolvedState } from "./types";
 
 const DAY = 86_400_000;
 const HOUR = 3_600_000;
@@ -720,6 +720,125 @@ describe("cache", () => {
     ).toBe("team");
   });
 
+  it("a read that began before a write's cache clear doesn't cache its older state (RC review 2, pre-existing)", async () => {
+    let hold: Promise<void> | null = null;
+    let reached: () => void = () => {};
+    const { auth, rt, source, organizationId, api } = await setup({
+      options: {
+        cacheTtlMs: 30_000,
+        // runs after the snapshot and override reads, before the cache fill
+        resolveEntitlements: async () => {
+          if (hold) {
+            const wait = hold;
+            hold = null;
+            reached();
+            await wait;
+          }
+          return {};
+        },
+      },
+    });
+    await setSnapshot(auth, organizationId, active("pro"));
+    let release: () => void = () => {};
+    hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const atHook = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    // the read has the "pro" snapshot and is held before it caches
+    const read = api.get(organizationId);
+    await atHook;
+    // a write lands meanwhile and clears the cache entry
+    source.states.set(organizationId, active("team"));
+    expect((await api.sync(organizationId)).plan.key).toBe("team");
+    expect(rt.cache.get(organizationId)?.result.plan.key).toBe("team");
+    release();
+    // the held read answers what it read, but doesn't replace the newer entry
+    expect((await read).plan.key).toBe("pro");
+    expect(rt.cache.get(organizationId)?.result.plan.key).toBe("team");
+    expect((await api.get(organizationId)).plan.key).toBe("team");
+  });
+
+  it("a read-through whose own write is followed by another write (during its plan.changed event) doesn't cache its older state", async () => {
+    let release: () => void = () => {};
+    let reached: () => void = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const atEvent = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    let events = 0;
+    const { rt, source, organizationId, api } = await setup({
+      options: {
+        cacheTtlMs: 30_000,
+        // a slow handler: the first plan.changed (free → pro, from the
+        // read-through's create) waits
+        onEvent: async (event) => {
+          if (event.type !== "entitlements.plan.changed") return;
+          events += 1;
+          if (events === 1) {
+            reached();
+            await held;
+          }
+        },
+      },
+    });
+    source.states.set(organizationId, active("pro"));
+    // no snapshot yet: the read reads through, writes "pro", and waits in
+    // its own write's event
+    const read = api.get(organizationId);
+    await atEvent;
+    // the subscription moves on and a push lands meanwhile
+    source.states.set(organizationId, active("team"));
+    expect((await api.sync(organizationId)).plan.key).toBe("team");
+    expect(rt.cache.get(organizationId)?.result.plan.key).toBe("team");
+    release();
+    expect((await read).plan.key).toBe("pro");
+    expect(rt.cache.get(organizationId)?.result.plan.key).toBe("team");
+    expect((await api.get(organizationId)).plan.key).toBe("team");
+  });
+
+  it("the cache's generation: a set that began before a delete or a clear of that organization is skipped", () => {
+    const state = (id: string, mark: string) =>
+      ({ result: { organizationId: id, mark } }) as unknown as ResolvedState;
+    const cache = createCache({ ttlMs: 10_000, maxEntries: 10 });
+    const before = cache.generation("a");
+    const other = cache.generation("b");
+    cache.delete("a");
+    cache.set("a", state("a", "old"), before);
+    expect(cache.get("a")).toBeUndefined();
+    // another organization's delete doesn't touch b's generation
+    cache.set("b", state("b", "kept"), other);
+    expect(cache.get("b")).toBeDefined();
+    const after = cache.generation("a");
+    cache.set("a", state("a", "new"), after);
+    expect(cache.get("a")).toBeDefined();
+    const beforeClear = cache.generation("a");
+    cache.clear();
+    cache.set("a", state("a", "old"), beforeClear);
+    expect(cache.get("a")).toBeUndefined();
+    // without a generation, set always stores
+    cache.set("a", state("a", "plain"));
+    expect(cache.get("a")).toBeDefined();
+  });
+
+  it("the generation table stays bounded and only ever refuses more, never less", () => {
+    const state = (id: string) =>
+      ({ result: { organizationId: id } }) as unknown as ResolvedState;
+    const cache = createCache({ ttlMs: 10_000, maxEntries: 2 });
+    const early = cache.generation("a");
+    cache.delete("a");
+    // many other deletes push a's entry out of the table
+    for (let i = 0; i < 5_000; i += 1) cache.delete(`org_${i}`);
+    cache.set("a", state("a"), early);
+    expect(cache.get("a")).toBeUndefined();
+    const fresh = cache.generation("a");
+    cache.set("a", state("a"), fresh);
+    expect(cache.get("a")).toBeDefined();
+  });
+
   it("is an LRU with a TTL; ttlMs 0 turns it off", () => {
     vi.useFakeTimers();
     const state = (id: string) =>
@@ -831,6 +950,36 @@ describe("syncOrganization", () => {
     expect(await snapshotRows(auth, "org_missing")).toHaveLength(0);
   });
 
+  it("an organization deleted between the read and the write throws not found on the retry and re-creates nothing (RC review 2 NB7)", async () => {
+    const { auth, rt, source, organizationId, onEvent } = await setup();
+    await setSnapshot(auth, organizationId, active("pro"));
+    const { adapter } = await getContext(auth);
+    const resolve = source.resolve;
+    let calls = 0;
+    source.resolve = async (id, ctx) => {
+      calls += 1;
+      const state = await resolve(id, ctx);
+      // the organization and its data are deleted while this call resolves
+      await adapter.deleteMany({
+        model: "entitlementSnapshot",
+        where: [{ field: "organizationId", value: id }],
+      });
+      await adapter.delete({
+        model: "organization",
+        where: [{ field: "id", value: id }],
+      });
+      return state;
+    };
+    source.states.set(organizationId, active("team"));
+    onEvent.mockClear();
+    await expect(syncOrganization(rt, organizationId)).rejects.toThrow(
+      `[@byo-oss/entitlements] syncOrganization: organization ${organizationId} not found`,
+    );
+    expect(calls).toBe(1);
+    expect(await snapshotRows(auth, organizationId)).toHaveLength(0);
+    expect(onEvent).not.toHaveBeenCalled();
+  });
+
   it("without a source writes nothing and resolves fresh", async () => {
     const auth = makeAuth();
     const rt = await getRuntime(auth);
@@ -877,7 +1026,7 @@ describe("cached results are read-only (RC review 1 #4)", () => {
       (first.limits as Record<string, unknown>).apiCalls = "unlimited";
     }).toThrow(TypeError);
     expect(() => {
-      first.overrides.push({
+      (first.overrides as AppliedOverride[]).push({
         kind: "feature",
         key: "exports",
         expiresAt: null,
@@ -910,6 +1059,50 @@ describe("cached results are read-only (RC review 1 #4)", () => {
     const [result] = await api.getMany([organizationId]);
     expect(Object.isFrozen(result)).toBe(true);
     expect(await api.get(organizationId)).toBe(result);
+  });
+
+  it("each caller gets its own copies of the result's Dates: setDate on one changes neither the cache nor the next result (RC review 2 NB4)", async () => {
+    const { auth, rt, source, organizationId, api } = await setup({
+      options: { cacheTtlMs: 30_000 },
+    });
+    const periodEnd = new Date(Date.now() + 30 * DAY);
+    const expiresAt = new Date(Date.now() + 7 * DAY);
+    source.states.set(organizationId, active("pro", { periodEnd }));
+    await seedOverride(auth, {
+      organizationId,
+      kind: "feature",
+      key: "sso",
+      value: true,
+      expiresAt,
+    });
+    const filled = await api.get(organizationId);
+    const hit = await api.get(organizationId);
+    const [many] = await api.getMany([organizationId]);
+    const results = [filled, hit, many];
+    for (const result of results) {
+      expect(result?.periodEnd?.getTime()).toBe(periodEnd.getTime());
+      expect(result?.overrides[0]?.expiresAt?.getTime()).toBe(
+        expiresAt.getTime(),
+      );
+      expect(Object.isFrozen(result)).toBe(true);
+      expect(Object.isFrozen(result?.overrides)).toBe(true);
+    }
+    // no two callers share a Date; the Date-free parts stay shared
+    expect(hit.periodEnd).not.toBe(filled.periodEnd);
+    expect(many?.periodEnd).not.toBe(hit.periodEnd);
+    expect(hit.overrides[0]?.expiresAt).not.toBe(
+      filled.overrides[0]?.expiresAt,
+    );
+    expect(hit.features).toBe(filled.features);
+    // a Date's own setters ignore Object.freeze: only a copy protects the cache
+    filled.periodEnd?.setFullYear(2000);
+    hit.overrides[0]?.expiresAt?.setFullYear(2000);
+    const next = await api.get(organizationId);
+    expect(next.periodEnd?.getTime()).toBe(periodEnd.getTime());
+    expect(next.overrides[0]?.expiresAt?.getTime()).toBe(expiresAt.getTime());
+    const cached = rt.cache.get(organizationId);
+    expect(cached?.result.periodEnd?.getTime()).toBe(periodEnd.getTime());
+    expect(cached?.snapshot?.periodEnd).not.toBe(cached?.result.periodEnd);
   });
 });
 

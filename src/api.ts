@@ -35,9 +35,14 @@ export type GetLimitResult<C extends AnyCatalog, K extends LimitKey<C>> =
  * answer what `onError` says, with `reason: "error"`. `sync` is the
  * exception: it throws when the billing source or the database fails.
  * `consumeUsage` and `sync` throw inside a transaction. Results are
- * read-only: a cached one is deep-frozen and shared with later callers.
- * A refusal's `upgradeTo` never names the current plan, and a 0 limit
- * answers `reason: "not_in_plan"`.
+ * read-only in their types: every field, record and array is `readonly`.
+ * At runtime a cacheable `get` or `getMany` result (a known organization,
+ * not degraded, read outside a transaction) is deep-frozen and shared with
+ * later callers, except its `Date`s, which each caller gets its own copies
+ * of; check results and the other `get` results are new objects on every
+ * call and not frozen. A check's `upgradeTo` lists only plans strictly
+ * better on that key than the current plan (never the current plan), and a
+ * 0 limit answers `reason: "not_in_plan"`.
  */
 export type Entitlements<C extends AnyCatalog> = {
   /** The organization's resolved plan, features, limits and live overrides (read-only). */

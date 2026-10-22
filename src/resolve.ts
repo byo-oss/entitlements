@@ -1,6 +1,6 @@
 import type { DBTransactionAdapter } from "better-auth";
 import { findManyIn, findOrganization } from "./adapter";
-import { freezeState } from "./cache";
+import { freezeState, servedState } from "./cache";
 import {
   canonicalPlanKey,
   isLimitValue,
@@ -24,6 +24,7 @@ import {
   snapshotPlan,
   toSnapshotFields,
   writeSnapshot,
+  writeSnapshotTracked,
 } from "./snapshot";
 import { assertOutsideTransaction, currentAdapter, inTransaction } from "./txn";
 import type {
@@ -227,6 +228,14 @@ type SnapshotLoad = {
   snapshot: EntitlementSnapshotRow | null;
   /** False when the organization doesn't exist (answer defaultPlan, cache nothing). */
   known: boolean;
+  /**
+   * Set by a read-through: the cache generation taken right after its own
+   * write's cache clear and before that write's `plan.changed` event
+   * (`writeSnapshotTracked`), or, when its write lost, before it re-read
+   * the newer row. The read caches against it instead of the one it took
+   * at its start, so its own write doesn't keep its (newest) state out.
+   */
+  generation?: number;
 };
 
 /**
@@ -249,13 +258,25 @@ async function readThrough(
     return { snapshot: null, known: false };
   }
   const state = await source.resolve(organizationId, { adapter });
-  const written = await writeSnapshot(rt, organizationId, state, {
+  const written = await writeSnapshotTracked(rt, organizationId, state, {
     previous: current,
     adapter,
   });
+  if (written.row && written.generation !== null) {
+    // taken right after this read's own write cleared the entry, before
+    // its plan.changed event: a write during the event moves it on
+    return {
+      snapshot: written.row,
+      known: true,
+      generation: written.generation,
+    };
+  }
+  // lost: re-read the newer row, with the generation from before that read
+  const generation = rt.cache.generation(organizationId);
   return {
-    snapshot: written ?? (await readSnapshot(rt, adapter, organizationId)),
+    snapshot: await readSnapshot(rt, adapter, organizationId),
     known: true,
+    generation,
   };
 }
 
@@ -355,20 +376,25 @@ async function refreshIfStale(
  * Caches a state and handles staleness, outside a transaction only. Returns
  * the state to hand back: a cacheable one (not degraded, a known
  * organization) as the deep-frozen copy the cache stores (`freezeState`),
- * also when the cache is off, so every caller gets a read-only result.
+ * with fresh copies of its `Date`s (`servedState`), also when the cache is
+ * off, so every caller gets a read-only result. `generation` is the
+ * organization's cache generation from before the state's first read: when
+ * a write cleared the entry since, the (older) state is returned but not
+ * cached.
  */
 async function settle(
   rt: EntitlementsRuntime,
   adapter: DBTransactionAdapter | null,
   state: ResolvedState,
   now: Date,
+  generation: number,
 ): Promise<ResolvedState> {
   if (state.result.degraded || !adapter) return state;
   if (state.snapshot) await refreshIfStale(rt, adapter, state.snapshot, now);
   if (!state.known) return state;
   const frozen = freezeState(state);
-  rt.cache.set(frozen.result.organizationId, frozen);
-  return frozen;
+  rt.cache.set(frozen.result.organizationId, frozen, generation);
+  return servedState(frozen);
 }
 
 // ---------------------------------------------------------------------------
@@ -387,7 +413,11 @@ async function settle(
  * `known: false`, persists nothing and isn't cached. Inside a transaction
  * it reads the cache but never fills it, persists nothing and schedules no
  * refresh. Outside one, a cacheable state comes back deep-frozen (the copy
- * the cache holds): results are read-only.
+ * the cache holds, with fresh copies of its `Date`s): results are
+ * read-only. The organization's cache generation is taken before the first
+ * read, so a write that clears the entry while this read runs keeps its
+ * (older) state out of the cache (a read-through takes it again right
+ * after its own write's cache clear, before that write's event).
  *
  * Never throws for an outage: when the database, the source or the
  * `resolveEntitlements` hook throws, it answers `defaultPlan` with
@@ -404,6 +434,9 @@ export async function resolveState(
     const hit = rt.cache.get(organizationId);
     if (hit) return hit;
   }
+  // taken before the first read: a write that clears the entry after this
+  // point keeps this read's state out of the cache
+  const generation = rt.cache.generation(organizationId);
   const now = rt.now();
   let adapter: DBTransactionAdapter | null = null;
   let inTx = true;
@@ -439,7 +472,9 @@ export async function resolveState(
     },
     now,
   );
-  return inTx ? state : settle(rt, adapter, state, now);
+  return inTx
+    ? state
+    : settle(rt, adapter, state, now, load.generation ?? generation);
 }
 
 /** `resolveState(...).result`: what `get` returns. */
@@ -457,7 +492,9 @@ export async function resolveEntitlements(
  * snapshot is missing or from another source goes through `resolveState`
  * (read-through). Without a source the misses' `organization` rows are
  * read the same way, so an id that isn't one comes back `known: false` and
- * isn't cached. Cached results are deep-frozen (read-only). An empty list returns `[]` with no query; more than
+ * isn't cached. Cached results are deep-frozen (read-only, with fresh
+ * `Date` copies), and each miss's cache generation is taken before the
+ * batch reads. An empty list returns `[]` with no query; more than
  * `MAX_GET_MANY` ids throws
  * `[@byo-oss/entitlements] getMany takes at most 1000 organization ids`.
  * A failed batch read degrades every organization it covered and logs once;
@@ -481,6 +518,10 @@ export async function resolveMany(
     else misses.push(id);
   }
   if (misses.length > 0) {
+    // taken before the batch reads (see resolveState)
+    const generations = new Map(
+      misses.map((id) => [id, rt.cache.generation(id)]),
+    );
     const now = rt.now();
     let adapter: DBTransactionAdapter | null = null;
     let inTx = true;
@@ -548,7 +589,18 @@ export async function resolveMany(
           },
           now,
         );
-        states.set(id, inTx ? state : await settle(rt, adapter, state, now));
+        states.set(
+          id,
+          inTx
+            ? state
+            : await settle(
+                rt,
+                adapter,
+                state,
+                now,
+                generations.get(id) as number,
+              ),
+        );
       }),
     );
   }
@@ -581,7 +633,9 @@ export const SYNC_WRITE_RETRIES = 3;
  *
  * Also throws when the source or the database throws (nothing persisted),
  * `[@byo-oss/entitlements] syncOrganization: organization <id> not found`
- * for an id that isn't an organization (nothing written), and
+ * for an id that isn't an organization (nothing written; also when a retry
+ * finds no snapshot and the organization was deleted since the first
+ * check, so a retry never re-creates a deleted organization's row), and
  * `[@byo-oss/entitlements] sync must run outside a transaction` inside one.
  * It doesn't log a failure: its caller does, once (`sync` logs and
  * rethrows, `refreshEntitlements` logs and answers 503, the `changed`
@@ -607,11 +661,11 @@ async function syncNow(
   organizationId: string,
 ): Promise<ResolvedState> {
   const adapter = await currentAdapter(rt);
-  if (!(await findOrganization(adapter, organizationId))) {
-    throw new Error(
+  const notFound = () =>
+    new Error(
       `${PREFIX} syncOrganization: organization ${organizationId} not found`,
     );
-  }
+  if (!(await findOrganization(adapter, organizationId))) throw notFound();
   const source = rt.options.source;
   if (source) {
     let written: EntitlementSnapshotRow | null = null;
@@ -622,6 +676,16 @@ async function syncNow(
         );
       }
       const previous = await readSnapshot(rt, adapter, organizationId);
+      // a retry that finds no row: the organization may have been deleted
+      // since the check above (its cleanup deletes the snapshot), and a
+      // create would bring the row back
+      if (
+        attempt > 1 &&
+        !previous &&
+        !(await findOrganization(adapter, organizationId))
+      ) {
+        throw notFound();
+      }
       const state = await source.resolve(organizationId, { adapter });
       written = await writeSnapshot(rt, organizationId, state, {
         previous,
