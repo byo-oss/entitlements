@@ -407,6 +407,98 @@ describe.each<Transport>(["api", "handler"])(
       ).toEqual(failure(404, ENTITLEMENTS_ERROR_CODES.OVERRIDE_NOT_FOUND));
     });
 
+    it("a plan override needs no value (left out or null); a feature or limit without one → 400", async () => {
+      const w = await world();
+      const base = { organizationId: w.organizationId, reason: "pilot" };
+      const left = await call(w.auth, transport, "set", w.staff.admin, {
+        ...base,
+        kind: "plan",
+        key: "team",
+      });
+      expect(left.status).toBe(200);
+      expect(left.body.override).toMatchObject({
+        kind: "plan",
+        key: "team",
+        value: null,
+      });
+      const nulled = await call(w.auth, transport, "set", w.staff.admin, {
+        ...base,
+        kind: "plan",
+        key: "pro",
+        value: null,
+      });
+      expect(nulled.status).toBe(200);
+      expect(nulled.body.override).toMatchObject({ key: "pro", value: null });
+      for (const target of [
+        { kind: "feature", key: "sso" },
+        { kind: "limit", key: "members" },
+      ]) {
+        expect(
+          await call(w.auth, transport, "set", w.staff.admin, {
+            ...base,
+            ...target,
+          }),
+        ).toEqual(failure(400, ENTITLEMENTS_ERROR_CODES.INVALID_OVERRIDE));
+      }
+    });
+
+    it("a malformed override body: 404 for a caller without access, 400 INVALID_OVERRIDE for staff", async () => {
+      const w = await world();
+      const valid = {
+        organizationId: w.organizationId,
+        kind: "feature",
+        key: "sso",
+        value: true,
+        reason: "pilot",
+      };
+      const malformedSet: Record<string, unknown>[] = [
+        {},
+        { organizationId: 42, kind: 7 },
+        { ...valid, organizationId: "" },
+        { ...valid, kind: 7 },
+        { ...valid, key: ["sso"] },
+        { ...valid, reason: 123 },
+        { ...valid, expiresAt: 5 },
+        [] as unknown as Record<string, unknown>,
+      ];
+      const malformedRemove: Record<string, unknown>[] = [
+        {},
+        { id: 5 },
+        { id: "" },
+        [] as unknown as Record<string, unknown>,
+      ];
+      const invalid = failure(400, ENTITLEMENTS_ERROR_CODES.INVALID_OVERRIDE);
+      for (const user of [w.owner, w.member, w.staff.member]) {
+        for (const body of malformedSet) {
+          expect(await call(w.auth, transport, "set", user, body)).toEqual(
+            orgNotFound,
+          );
+        }
+        for (const body of malformedRemove) {
+          expect(await call(w.auth, transport, "remove", user, body)).toEqual(
+            orgNotFound,
+          );
+        }
+      }
+      for (const body of malformedSet) {
+        expect(
+          await call(w.auth, transport, "set", w.staff.admin, body),
+        ).toEqual(invalid);
+      }
+      for (const body of malformedRemove) {
+        expect(
+          await call(w.auth, transport, "remove", w.staff.admin, body),
+        ).toEqual(invalid);
+      }
+      // the org check still comes before the rest of the shape
+      expect(
+        await call(w.auth, transport, "set", w.staff.admin, {
+          organizationId: "org_missing",
+          kind: 7,
+        }),
+      ).toEqual(orgNotFound);
+    });
+
     it("the override list needs read in the staff org", async () => {
       const w = await world();
       await seedOverride(w.auth, {

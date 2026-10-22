@@ -5,7 +5,9 @@
  */
 import { createEntitlements } from "./api";
 import {
+  type AnyCatalog,
   type CapacityKey,
+  type Catalog,
   defineEntitlements,
   type FeatureKey,
   type MeteredKey,
@@ -163,6 +165,48 @@ export function catalogErrors() {
     },
     defaultPlan: "free",
   });
+}
+
+// each plan keeps its display type (a pricing page reads the catalog itself)
+export function displayTypes() {
+  const priced = defineEntitlements({
+    features: ["exports"],
+    limits: { apiCalls: { kind: "metered", period: "day" } },
+    plans: {
+      free: {
+        features: { exports: false },
+        limits: { apiCalls: 1 },
+        display: { name: "Free" },
+      },
+      pro: {
+        features: { exports: true },
+        limits: { apiCalls: 2 },
+        display: { name: "Pro", tagline: "For teams" },
+      },
+      internal: { features: { exports: true }, limits: { apiCalls: 3 } },
+    },
+    defaultPlan: "free",
+  });
+  const name: string = priced.plans.pro.display.name;
+  assertType<Equal<typeof priced.plans.pro.display.name, "Pro">>();
+  assertType<Equal<typeof priced.plans.pro.display.tagline, "For teams">>();
+  // @ts-expect-error not a field of pro's display
+  priced.plans.pro.display.missing;
+  // @ts-expect-error a field only another plan's display has
+  priced.plans.free.display.tagline;
+  // @ts-expect-error a plan without display has none
+  priced.plans.internal.display.name;
+  // over every plan: each name, or undefined for a plan without display
+  const names = Object.values(priced.plans).map((plan) => plan.display?.name);
+  assertType<Equal<(typeof names)[number], "Free" | "Pro" | undefined>>();
+
+  // a typed catalog still fits the wide types
+  const any: AnyCatalog = priced;
+  const wide: Catalog = priced;
+  // the default display type: optional and free-form
+  const wideName = wide.plans.free?.display?.name;
+  assertType<Equal<typeof wideName, unknown>>();
+  return [name, any, wideName];
 }
 
 export async function callSites(organizationId: string) {

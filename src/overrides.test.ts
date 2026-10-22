@@ -213,6 +213,28 @@ describe("validateOverride", () => {
     }
   });
 
+  it("a plan override may leave value out; a feature or limit may not", async () => {
+    const { rt } = await setup();
+    const { value: _value, ...noValue } = base;
+    expect(
+      validateOverride(rt, { ...noValue, kind: "plan", key: "team" }, NOW),
+    ).toMatchObject({ kind: "plan", key: "team", value: null });
+    rejects(rt, noValue);
+    rejects(rt, { ...noValue, kind: "limit", key: "members" });
+  });
+
+  it("refuses fields of the wrong type or left out (the body is loose)", async () => {
+    const { rt } = await setup();
+    const { kind: _kind, ...noKind } = base;
+    const { key: _key, ...noKey } = base;
+    const { reason: _reason, ...noReason } = base;
+    for (const input of [noKind, noKey, noReason]) rejects(rt, input);
+    rejects(rt, { ...base, kind: 7 });
+    rejects(rt, { ...base, key: ["exports"] });
+    rejects(rt, { ...base, reason: 42 });
+    rejects(rt, { ...base, expiresAt: {} });
+  });
+
   it("refuses an expiresAt that doesn't parse or isn't in the future", async () => {
     const { rt } = await setup();
     rejects(rt, { ...base, expiresAt: "not a date" });
@@ -221,7 +243,7 @@ describe("validateOverride", () => {
     rejects(rt, { ...base, expiresAt: NOW });
     rejects(rt, { ...base, expiresAt: new Date(NOW.getTime() - 1) });
     rejects(rt, { ...base, expiresAt: "2020-01-01T00:00:00.000Z" });
-    rejects(rt, { ...base, expiresAt: 123 as unknown as string });
+    rejects(rt, { ...base, expiresAt: 123 });
   });
 
   it("refuses a reason outside 1-500 characters after trimming", async () => {
@@ -229,7 +251,7 @@ describe("validateOverride", () => {
     rejects(rt, { ...base, reason: "" });
     rejects(rt, { ...base, reason: "   \n\t " });
     rejects(rt, { ...base, reason: "x".repeat(MAX_REASON_LENGTH + 1) });
-    rejects(rt, { ...base, reason: undefined as unknown as string });
+    rejects(rt, { ...base, reason: undefined });
   });
 });
 

@@ -27,15 +27,22 @@ export const MAX_REASON_LENGTH = 500;
 
 const MODEL = "entitlementOverride";
 
-/** `setEntitlementOverride`'s body, as received (`kind` unchecked). */
+/**
+ * `setEntitlementOverride`'s body, as received: only `organizationId` is
+ * checked (by the endpoint, before `requireOrgExists`); every other field
+ * may be missing or of any type, and `validateOverride` refuses a bad one
+ * with `INVALID_OVERRIDE`.
+ */
 export type OverrideInput = {
   organizationId: string;
-  /** Any string: a kind other than `plan`, `feature` or `limit` is `INVALID_OVERRIDE`. */
-  kind: string;
-  key: string;
+  /** A kind other than `plan`, `feature` or `limit` is `INVALID_OVERRIDE`. */
+  kind?: unknown;
+  key?: unknown;
+  /** Left out or `null` for a plan override. */
   value?: unknown;
-  reason: string;
-  expiresAt?: Date | string | null;
+  reason?: unknown;
+  /** A `Date`, a date string, `null` or left out (no expiry). */
+  expiresAt?: unknown;
 };
 
 /** An override that passed `validateOverride`. */
@@ -104,7 +111,7 @@ function expiry(value: unknown, now: Date): Date | null {
  * Checks an override against the catalog: `kind` is `plan`, `feature` or
  * `limit`; `key` is a plan, feature or limit key for its `kind` (a plan
  * alias is not a plan key); a feature value is a boolean, a limit value a
- * non-negative integer or `"unlimited"`, a plan value null/absent;
+ * non-negative integer or `"unlimited"`, a plan value `null` or left out;
  * `expiresAt`, if given, parses and is after `now`; `reason` is 1–500
  * characters after trimming (the trimmed reason is kept). Otherwise 400
  * `INVALID_OVERRIDE`.

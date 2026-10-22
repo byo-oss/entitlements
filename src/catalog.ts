@@ -59,34 +59,55 @@ export type LimitKind = LimitDefinition["kind"];
 /** A limit's value in a plan: a non-negative integer, or `"unlimited"`. */
 export type LimitValue = number | "unlimited";
 
-/** What one plan includes. Every feature and limit key is set, and nothing else. */
+/** The display copy a plan may carry when its type isn't known. */
+type AnyDisplay = Readonly<Record<string, unknown>> | undefined;
+
+// `display` is optional when `D` includes `undefined` (a plan without one,
+// or display not known), required otherwise
+type PlanDisplay<D> = undefined extends D
+  ? { readonly display?: Exclude<D, undefined> }
+  : { readonly display: D };
+
+/**
+ * What one plan includes. Every feature and limit key is set, and nothing
+ * else. `D` is the plan's display type: `defineEntitlements` infers it
+ * from the plan as written (`undefined` when the plan has none); the
+ * default is an optional `Readonly<Record<string, unknown>>`.
+ */
 export type PlanDefinition<
   F extends string = string,
   L extends string = string,
+  D = AnyDisplay,
 > = {
   readonly features: { readonly [K in F]: boolean };
   readonly limits: { readonly [K in L]: LimitValue };
-  /** Free-form display copy (name, tagline, …), returned as given. */
-  readonly display?: Readonly<Record<string, unknown>>;
-};
+} & PlanDisplay<D>;
 
-/** A catalog as `defineEntitlements` returns it. */
+/**
+ * A catalog as `defineEntitlements` returns it. `D` maps each plan key to
+ * that plan's display type (free-form copy such as a name or tagline,
+ * returned as given), so `catalog.plans.pro.display.name` is typed. It
+ * defaults to an optional `Readonly<Record<string, unknown>>` per plan.
+ */
 export type Catalog<
   F extends string = string,
   LD extends Record<string, LimitDefinition> = Record<string, LimitDefinition>,
   P extends string = string,
   A extends string = string,
+  D extends { readonly [K in P]: unknown } = { readonly [K in P]: AnyDisplay },
 > = {
   readonly features: readonly F[];
   readonly limits: LD;
-  readonly plans: { readonly [K in P]: PlanDefinition<F, keyof LD & string> };
+  readonly plans: {
+    readonly [K in P]: PlanDefinition<F, keyof LD & string, D[K]>;
+  };
   readonly defaultPlan: P;
   readonly planAliases: { readonly [K in A]: P };
 };
 
 /** Any catalog. Functions that work on every catalog take this. */
 // biome-ignore lint/suspicious/noExplicitAny: the widest catalog; key types are checked where they're used
-export type AnyCatalog = Catalog<any, any, any, any>;
+export type AnyCatalog = Catalog<any, any, any, any, any>;
 
 /** The feature keys of a catalog. */
 export type FeatureKey<C extends AnyCatalog> = C["features"][number] & string;
@@ -190,6 +211,14 @@ type CheckPlan<K, X, F extends string, L extends string> = K extends string
 type CheckAlias<K, P extends string> = K extends P
   ? `plan alias "${K & string}" shadows a plan`
   : P;
+
+// each plan's display type as written: the plan's own `display`, or
+// `undefined` when it sets none
+type PlanDisplays<PL> = {
+  readonly [K in keyof PL]: "display" extends keyof PL[K]
+    ? PL[K]["display" & keyof PL[K]]
+    : undefined;
+};
 
 /** The object `defineEntitlements` takes, as the app writes it. */
 export type CatalogInput<
@@ -381,7 +410,8 @@ export function validateCatalog(catalog: unknown): void {
 /**
  * Declares the catalog. Checks it with `validateCatalog` (a bad catalog is
  * a type error, and throws here too) and returns it typed, with
- * `planAliases` defaulted to `{}`.
+ * `planAliases` defaulted to `{}`. Each plan keeps its `display` type, so a
+ * pricing page reads `catalog.plans.pro.display.name` typed.
  */
 export function defineEntitlements<
   const F extends string,
@@ -390,7 +420,7 @@ export function defineEntitlements<
   const AL extends Record<string, keyof PL & string> = Record<never, never>,
 >(
   catalog: CatalogInput<F, LD, PL, AL>,
-): Catalog<F, LD, keyof PL & string, keyof AL & string> {
+): Catalog<F, LD, keyof PL & string, keyof AL & string, PlanDisplays<PL>> {
   validateCatalog(catalog);
   return {
     features: catalog.features,
@@ -398,7 +428,13 @@ export function defineEntitlements<
     plans: catalog.plans,
     defaultPlan: catalog.defaultPlan,
     planAliases: catalog.planAliases ?? {},
-  } as unknown as Catalog<F, LD, keyof PL & string, keyof AL & string>;
+  } as unknown as Catalog<
+    F,
+    LD,
+    keyof PL & string,
+    keyof AL & string,
+    PlanDisplays<PL>
+  >;
 }
 
 /** The plan keys, in catalog order. */

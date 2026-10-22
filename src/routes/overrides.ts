@@ -51,6 +51,29 @@ const LIST_ROUTE: EntitlementsRoute = {
   path: "/entitlements/overrides",
 };
 
+const invalidOverride = () =>
+  APIError.from("BAD_REQUEST", ENTITLEMENTS_ERROR_CODES.INVALID_OVERRIDE);
+
+/*
+ * The override bodies accept anything: each field is `z.unknown().optional()`,
+ * and a body that isn't an object (missing, `null`, an array, a string)
+ * reads as `{}`. Nothing is refused before the staff gate, so a caller
+ * without access always gets 404; the handler checks the shape after
+ * `requireStaff` (and, for set, `requireOrgExists`).
+ */
+const anything = () => z.unknown().optional();
+const SET_BODY = z
+  .object({
+    organizationId: anything(),
+    kind: anything(),
+    key: anything(),
+    value: anything(),
+    reason: anything(),
+    expiresAt: anything(),
+  })
+  .catch({});
+const REMOVE_BODY = z.object({ id: anything() }).catch({});
+
 const invalidCursor = () =>
   APIError.from("BAD_REQUEST", ENTITLEMENTS_ERROR_CODES.INVALID_CURSOR);
 
@@ -207,13 +230,16 @@ async function listPage(
  * The staff endpoints, each `sessionMiddleware` then `requireStaff`:
  * - `setEntitlementOverride` (POST `/entitlements/override/set`,
  *   `entitlements:override`): `requireOrgExists`, `validateOverride`,
- *   `setOverride` → `{ override }`. The body schema is loose (`kind`,
- *   `key` any string, `value` unknown), so every override rule answers 400
- *   `INVALID_OVERRIDE`; only a field of the wrong JSON type for a string
- *   (or `expiresAt` that is neither a string, a Date nor null) gets
- *   better-auth's own 400.
+ *   `setOverride` → `{ override }`. The body schema accepts anything, so
+ *   a caller without access gets 404 whatever it sends; after the gates a
+ *   missing or empty `organizationId` and every override rule (`kind`,
+ *   `key`, `value`, `reason`, `expiresAt`, each of any JSON type) answer
+ *   400 `INVALID_OVERRIDE`. A plan override's `value` may be left out or
+ *   `null`.
  * - `removeEntitlementOverride` (POST `/entitlements/override/remove`,
- *   `entitlements:override`): `removeOverride` → `{ ok: true }`.
+ *   `entitlements:override`): `removeOverride` → `{ ok: true }`. Loose
+ *   too: after the gate a missing or non-string `id` is 400
+ *   `INVALID_OVERRIDE`.
  * - `listEntitlementOverrides` (GET `/entitlements/overrides`,
  *   `entitlements:read`): newest first, 50 per page, keyset cursor; a
  *   malformed cursor or a page past the tie bound (250 overrides sharing
@@ -227,17 +253,10 @@ export function overrideEndpoints(rt: EntitlementsRuntime) {
       "/entitlements/override/set",
       {
         method: "POST",
-        // loose on purpose: a wrong kind, key or value reaches
-        // validateOverride and answers 400 INVALID_OVERRIDE, not
-        // better-auth's own 400
-        body: z.object({
-          organizationId: z.string().min(1),
-          kind: z.string(),
-          key: z.string(),
-          value: z.unknown(),
-          reason: z.string(),
-          expiresAt: z.union([z.date(), z.string()]).nullable().optional(),
-        }),
+        // loose on purpose (every field unknown, any body at all): a
+        // non-staff caller gets 404 whatever it sends, and every shape or
+        // override rule is checked after the gates (400 INVALID_OVERRIDE)
+        body: SET_BODY,
         use: [sessionMiddleware],
       },
       async (ctx): Promise<SetOverrideResponse> => {
@@ -248,12 +267,16 @@ export function overrideEndpoints(rt: EntitlementsRuntime) {
           SET_ROUTE,
         );
         const body = ctx.body;
-        await requireOrgExists(
+        const { organizationId } = body;
+        if (typeof organizationId !== "string" || organizationId === "") {
+          throw invalidOverride();
+        }
+        await requireOrgExists(rt, await currentAdapter(rt), organizationId);
+        const valid = validateOverride(
           rt,
-          await currentAdapter(rt),
-          body.organizationId,
+          { ...body, organizationId },
+          rt.now(),
         );
-        const valid = validateOverride(rt, body, rt.now());
         const row = await setOverride(rt, valid, { userId: session.user.id });
         return { override: toPublicOverride(row) };
       },
@@ -262,7 +285,8 @@ export function overrideEndpoints(rt: EntitlementsRuntime) {
       "/entitlements/override/remove",
       {
         method: "POST",
-        body: z.object({ id: z.string().min(1) }),
+        // loose for the same reason as set: the gate answers first
+        body: REMOVE_BODY,
         use: [sessionMiddleware],
       },
       async (ctx): Promise<RemoveOverrideResponse> => {
@@ -272,7 +296,9 @@ export function overrideEndpoints(rt: EntitlementsRuntime) {
           "override",
           REMOVE_ROUTE,
         );
-        await removeOverride(rt, ctx.body.id, { userId: session.user.id });
+        const { id } = ctx.body;
+        if (typeof id !== "string" || id === "") throw invalidOverride();
+        await removeOverride(rt, id, { userId: session.user.id });
         return { ok: true };
       },
     ),
