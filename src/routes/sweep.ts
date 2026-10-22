@@ -1,12 +1,12 @@
-// BYO_STUB: N07 replaces this file (contracts.md "routes/sweep.ts")
 import { createAuthEndpoint } from "better-auth/api";
 import * as z from "zod";
 import type { EntitlementsRuntime } from "../runtime";
 import { runSync } from "../sync";
+import type { EntitlementsSweepResult } from "../types";
 
 /**
- * `processEntitlementsSync`: `createAuthEndpoint.serverOnly` (no path),
- * returns `runSync(rt)`. Call it from a cron
+ * `processEntitlementsSync`: `createAuthEndpoint.serverOnly` (no path, so
+ * no HTTP route), returns `runSync(rt)`. Call it from a cron
  * (`auth.api.processEntitlementsSync()`), again while `hasMore` is true.
  */
 export function sweepEndpoints(rt: EntitlementsRuntime) {
@@ -16,7 +16,7 @@ export function sweepEndpoints(rt: EntitlementsRuntime) {
         method: "POST",
         body: z.object({}).optional(),
       },
-      async () => runSync(rt),
+      async (): Promise<EntitlementsSweepResult> => runSync(rt),
     ),
   };
 }
