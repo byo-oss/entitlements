@@ -1,0 +1,6 @@
+allowBuilds:
+  esbuild: true
+minimumReleaseAgeExclude:
+  - "@byo-oss/*"
+overrides:
+  "@byo-oss/entitlements": "file:./.tarballs/byo-oss-entitlements-0.1.0.tgz"
