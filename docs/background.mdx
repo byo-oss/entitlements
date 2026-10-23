@@ -101,7 +101,7 @@ export const auth = betterAuth({
 });
 ```
 
-With `organizationCleanup: false` and no hook, SQL adapters still cascade through the foreign keys; the memory adapter and MongoDB keep the rows until `deleteOrganizationData` runs. With `@byo-oss/core`, its `deleteOrganizationData(auth, organizationId)` reaches this plugin through `byo.deleteOrganizationData`, so one call cleans every BYO plugin.
+With `organizationCleanup: false` and no hook, SQL adapters still cascade through the foreign keys; the memory adapter and MongoDB keep the rows until `deleteOrganizationData` runs. On SQL the cascade removes the rows too, but the call also clears this process's cached entitlements for the organization, so keep it. With `@byo-oss/core`, its `deleteOrganizationData(auth, organizationId)` reaches this plugin through `byo.deleteOrganizationData`, so one call cleans every BYO plugin.
 
 ## Deleting a user
 

@@ -14,7 +14,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@byo-oss/entitlements": "^0.1.0",
+    "@byo-oss/entitlements": "^0.2.0",
     "@tanstack/react-router": "^1.170.44",
     "@tanstack/react-start": "^1.169.2",
     "better-auth": "^1.7.7",

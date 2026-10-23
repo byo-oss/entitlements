@@ -171,6 +171,37 @@ Five steps. Each ends on a check.
 - `upgradeTo(catalog, { feature: "sso" })` and `upgradeTo(catalog, { limit: "projects", atLeast: 10 })` return the plan keys that would unlock it, in catalog order.
 - The catalog passed to `createEntitlements` must be the one the plugin was given (same reference, else deep equality), or the first call throws `[@byo-oss/entitlements] createEntitlements got a different catalog than the plugin`.
 
+One display shape for every plan (0.2.0): pass the shape's interface as a type argument to a zero-argument call, `defineEntitlements<PlanCopy>()({ ... })`. Each plan's `display` must be assignable to it: a required key must be there, and a top-level key the interface doesn't name is an error. Each plan keeps its own literal types (`catalog.plans.pro.display.support` stays `"Priority"`), and a `readonly string[]` field takes `["a", "b"]` inline. It is curried because TypeScript can't infer the catalog's types when only some type arguments are given, so the shape is fixed in the first call. The one-call form above is unchanged.
+
+```ts
+// lib/plan-copy.ts
+import { defineEntitlements } from "@byo-oss/entitlements/catalog"
+
+export interface PlanCopy {
+  readonly name: string
+  readonly support: "Community" | "Priority"
+  readonly items: readonly string[]
+}
+
+export const catalog = defineEntitlements<PlanCopy>()({
+  features: ["sso"],
+  limits: { seats: { kind: "capacity" } },
+  plans: {
+    free: {
+      features: { sso: false },
+      limits: { seats: 3 },
+      display: { name: "Free", support: "Community", items: ["3 seats"] },
+    },
+    pro: {
+      features: { sso: true },
+      limits: { seats: 25 },
+      display: { name: "Pro", support: "Priority", items: ["25 seats", "SSO"] },
+    },
+  },
+  defaultPlan: "free",
+})
+```
+
 ## Options
 
 Every duration is in milliseconds except `pastDueGraceDays` (days). A value given in the wrong unit fails boot instead of silently meaning milliseconds, which is what the floors are for.
@@ -279,6 +310,7 @@ Only the first carries the `UNKNOWN_KEY` code; the other two are plain `Error`s 
 Result rules:
 
 - A limit of 0 means "not included": `getLimit`, `consumeUsage` and `checkCapacity` all answer `reason: "not_in_plan"`. A metered refusal still counts toward `refused`, and the first one in a period emits `limit_reached`.
+- `consumeUsage` on an `"unlimited"` metered limit still counts: `used` keeps growing, for reports, at one write per call (plus the counter's create on a period's first call). The catalog's plan alone doesn't say whether a key is unlimited: an override or `resolveEntitlements` can lift or lower a cap, and `get(organizationId).limits[key]` is the resolved value.
 - `upgradeTo` lists only plans strictly better on that key than the organization's current plan; it never names the current plan or a cheaper one.
 - Cached results are read-only and the public result types are `Readonly`; copy one before changing it. Check results and the degraded or unknown-organization results are plain fresh objects, and a `Date` in a result is a fresh copy on every call.
 
@@ -301,6 +333,8 @@ export async function guardApiCall(organizationId: string, headers: Headers): Pr
   return new Response("Limit reached", { status: r.reason === "error" ? 503 : 429, headers })
 }
 ```
+
+An `"unlimited"` key (from the plan, an override or `resolveEntitlements`) reports `limit` and `remaining` as the string `"unlimited"`, not a number. Don't put a large number in their place (such as `Number.MAX_SAFE_INTEGER`) for headers, API fields or progress bars: send or show the pair only when both are numbers, and show "unlimited" otherwise.
 
 **Failure policy.** When the database, the billing source or your `resolveEntitlements` hook throws, `get`, `getMany` and `getLimit` answer from `defaultPlan` with `degraded: true`, and `hasFeature`, `consumeUsage` and `checkCapacity` answer what `onError` says, with `reason: "error"`. Each failure is logged once. An id that isn't an organization answers `defaultPlan` without `degraded` and writes nothing; `consumeUsage` refuses it with `not_in_plan` and creates no counter.
 
@@ -617,7 +651,7 @@ export async function purgeOrganization(organizationId: string): Promise<void> {
 }
 ```
 
-- With `organizationCleanup: false` and no hook, SQL adapters still cascade through the foreign keys; the memory adapter and MongoDB keep the rows until `deleteOrganizationData` runs.
+- With `organizationCleanup: false` and no hook, SQL adapters still cascade through the foreign keys; the memory adapter and MongoDB keep the rows until `deleteOrganizationData` runs. On SQL the cascade removes the rows too, but the call also clears this process's cached entitlements for the organization, so keep it.
 - Deleting a user clears `createdBy` and `removedBy` on overrides (a hook, so memory and MongoDB match SQL's `set null`). Overrides keep their author after that person leaves the staff organization.
 - Nothing is stored per member, so there is no member cleanup.
 

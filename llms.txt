@@ -41,6 +41,8 @@ export const catalog = defineEntitlements({
 })
 ```
 
+One display shape for every plan (0.2.0): `defineEntitlements<PlanCopy>()({ ... })` takes an interface as its type argument, and every plan's `display` must be assignable to it (a required key must be there; a top-level key the interface doesn't name is an error). Each plan keeps its own literal types (`display.support` stays `"Priority"`), `items: ["a"]` works for a `readonly string[]` field, and the one-call form is unchanged. It is curried because TypeScript can't infer the catalog's types when only some type arguments are given.
+
 ```ts
 // lib/permissions.ts
 // access control: spread the statements, give roles the actions.
@@ -131,7 +133,7 @@ export async function examples(orgId: string, orgIds: string[]) {
 ```
 
 - reason: "ok" | "not_in_plan" | "limit_reached" | "error".
-- consumeUsage is one guarded incrementOne: atomic, refusals never count (used unchanged, refused +1), firstRefusal is true once per period (emits limit_reached). amount is a positive integer.
+- consumeUsage is one guarded incrementOne: atomic, refusals never count (used unchanged, refused +1), firstRefusal is true once per period (emits limit_reached). amount is a positive integer. On an "unlimited" limit it still counts (one write per call, plus the counter's create on a period's first call; used keeps growing) and reports limit and remaining as the string "unlimited": send or show the pair only when both are numbers, never invent a large number.
 - A limit of 0 means not included: getLimit, consumeUsage and checkCapacity all answer reason "not_in_plan" (a metered refusal still counts toward refused, and the first one in a period emits limit_reached). A metered key with remaining 0 → limit_reached. upgradeTo lists only plans strictly better on that key than the org's current plan (never the current or a cheaper plan). Cached results are read-only and the public result types are Readonly; check results and degraded/unknown-org results are plain fresh objects, and Dates in results are fresh copies per call. Copy before changing.
 - checkCapacity: allowed = count + adding <= limit; over = count > limit (a downgraded org). You supply count. For seats, count members plus pending invitations when they hold a seat, and ignore expired invitations: better-auth keeps an expired invitation at status "pending", so also require expiresAt in the future. Two concurrent creates can both pass checkCapacity: lock the organization row (SELECT … FOR UPDATE) in the transaction that counts and creates.
 - Failure policy: reads never throw for an outage. A throwing db/source/resolveEntitlements hook → get/getMany/getLimit answer defaultPlan with degraded: true; hasFeature/consumeUsage/checkCapacity answer onError(error, { organizationId, key, operation }) ("deny" by default) with reason "error". One log line per failure. An id that is not an organization answers defaultPlan, not degraded, and writes nothing (consumeUsage refuses it with not_in_plan and creates no counter).

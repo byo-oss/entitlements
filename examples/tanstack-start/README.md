@@ -94,7 +94,7 @@ remove `entitlements()` from `src/lib/auth-options.ts`; better-auth's own tables
 ## Packed tarball
 
 `pnpm-workspace.yaml` overrides `@byo-oss/entitlements` to
-`.tarballs/byo-oss-entitlements-0.1.0.tgz`, packed from the package's checkout, so the example
+`.tarballs/byo-oss-entitlements-0.2.0.tgz`, packed from the package's checkout, so the example
 runs against what would be published. Pack it into `.tarballs/` (git-ignored) before
 `pnpm install`. `@byo-oss/core` comes from npm. To use the published package, delete the
 `overrides` block.

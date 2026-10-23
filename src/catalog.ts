@@ -185,7 +185,15 @@ type Only<X, Keys extends PropertyKey, V> = { readonly [K in Keys]: V } & {
   readonly [K in Exclude<keyof X, Keys>]: never;
 };
 
-type CheckPlan<K, X, F extends string, L extends string> = K extends string
+// `D` is the shared display shape from `defineEntitlements<D>()`; the
+// default is the untyped display of the one-call form
+type CheckPlan<
+  K,
+  X,
+  F extends string,
+  L extends string,
+  D extends object = Readonly<Record<string, unknown>>,
+> = K extends string
   ? IsPlanKey<K> extends true
     ? {
         readonly features: Only<
@@ -198,15 +206,35 @@ type CheckPlan<K, X, F extends string, L extends string> = K extends string
           L,
           LimitValue
         >;
-        readonly display?: Readonly<Record<string, unknown>>;
+        readonly display?: D;
       } & {
         readonly [Extra in Exclude<
           keyof X,
           "features" | "limits" | "display"
         >]: never;
-      }
+      } & ShapeRules<X, D>
     : `plan key "${K}" must match /^[a-z][a-z0-9_-]*$/`
   : never;
+
+// the keys of `D`, or of each member when `D` is a union
+type ShapeKeys<D> = D extends unknown ? keyof D : never;
+
+// With a shared shape `D` (not the untyped default): `display` is required
+// when `D` has a required key, and a top-level display key `D` doesn't name
+// is an error. The required rule holds even for a `D` with an index signature
+type ShapeRules<X, D> = (Record<never, never> extends D
+  ? unknown
+  : { readonly display: D }) &
+  (string extends ShapeKeys<D>
+    ? unknown
+    : {
+        readonly display?: {
+          readonly [K in Exclude<
+            X extends { display: infer XD } ? keyof XD : never,
+            ShapeKeys<D>
+          >]: never;
+        };
+      });
 
 type CheckAlias<K, P extends string> = K extends P
   ? `plan alias "${K & string}" shadows a plan`
@@ -226,6 +254,7 @@ export type CatalogInput<
   LD extends Record<string, LimitDefinition>,
   PL extends Record<string, unknown>,
   AL extends Record<string, keyof PL & string>,
+  D extends object = Readonly<Record<string, unknown>>,
 > = {
   readonly features: readonly F[];
   readonly limits: LD;
@@ -234,7 +263,8 @@ export type CatalogInput<
       K,
       PL[K],
       NoInfer<F>,
-      NoInfer<keyof LD & string>
+      NoInfer<keyof LD & string>,
+      D
     >;
   };
   readonly defaultPlan: NoInfer<keyof PL & string>;
@@ -408,6 +438,33 @@ export function validateCatalog(catalog: unknown): void {
 }
 
 /**
+ * Declares the catalog with one display shape for every plan. Call it with
+ * the shape as the type argument, then call the result with the catalog:
+ *
+ * ```ts
+ * const catalog = defineEntitlements<PlanCopy>()({ ... });
+ * ```
+ *
+ * Each plan's `display` must be assignable to `D`: required when `D` has a
+ * required key, and a top-level key `D` doesn't name is an error. Each plan keeps its
+ * own display literal, as in the one-call form.
+ *
+ * It is curried because TypeScript has no partial type-argument inference:
+ * giving `D` explicitly would force `F`, `LD`, `PL` and `AL` to be given too,
+ * so the shape is fixed first and the catalog's own types are inferred from
+ * the second call.
+ */
+export function defineEntitlements<
+  D extends object = Readonly<Record<string, unknown>>,
+>(): <
+  const F extends string,
+  const LD extends Record<string, LimitDefinition>,
+  const PL extends Record<string, unknown>,
+  const AL extends Record<string, keyof PL & string> = Record<never, never>,
+>(
+  catalog: CatalogInput<F, LD, PL, AL, D>,
+) => Catalog<F, LD, keyof PL & string, keyof AL & string, PlanDisplays<PL>>;
+/**
  * Declares the catalog. Checks it with `validateCatalog` (a bad catalog is
  * a type error, and throws here too) and returns it typed, with
  * `planAliases` defaulted to `{}`. Each plan keeps its `display` type, so a
@@ -420,21 +477,28 @@ export function defineEntitlements<
   const AL extends Record<string, keyof PL & string> = Record<never, never>,
 >(
   catalog: CatalogInput<F, LD, PL, AL>,
-): Catalog<F, LD, keyof PL & string, keyof AL & string, PlanDisplays<PL>> {
-  validateCatalog(catalog);
+): Catalog<F, LD, keyof PL & string, keyof AL & string, PlanDisplays<PL>>;
+export function defineEntitlements(...args: unknown[]): unknown {
+  // no arguments: the shape was fixed by the type argument; return the definer
+  if (args.length === 0) return (catalog: unknown) => buildCatalog(catalog);
+  return buildCatalog(args[0]);
+}
+
+function buildCatalog(input: unknown): unknown {
+  validateCatalog(input);
+  const catalog = input as CatalogInput<
+    string,
+    Record<string, LimitDefinition>,
+    Record<string, unknown>,
+    Record<string, string>
+  >;
   return {
     features: catalog.features,
     limits: catalog.limits,
     plans: catalog.plans,
     defaultPlan: catalog.defaultPlan,
     planAliases: catalog.planAliases ?? {},
-  } as unknown as Catalog<
-    F,
-    LD,
-    keyof PL & string,
-    keyof AL & string,
-    PlanDisplays<PL>
-  >;
+  };
 }
 
 /** The plan keys, in catalog order. */
