@@ -1,0 +1,66 @@
+---
+title: Events
+description: The events entitlements emits through onEvent, when they fire, what each carries, and how to tell an organization's owners about a reached limit with notifications.
+group: guides
+order: 6
+---
+
+Pass `onEvent` to receive an event after each write that matters. Events are in-process and best-effort: a handler that throws is logged and never fails the call, and nothing is stored or retried.
+
+## Event types
+
+`ENTITLEMENTS_EVENT_TYPES` lists them, and `EntitlementsEvent` types each one:
+
+| `type` | When | `subject` | `data` |
+|---|---|---|---|
+| `entitlements.plan.changed` | A snapshot write changes the plan the billing state resolves to, including the first snapshot of an organization that is already paying. Overrides never emit it | `{ type: "organization", id }` | `{ from, to, status }` |
+| `entitlements.override.set` | An override is created or replaced | `{ type: "entitlementOverride", id }` | `{ kind, key, value, expiresAt }` |
+| `entitlements.override.removed` | Staff removed an override. Expiry emits nothing | `{ type: "entitlementOverride", id }` | `{ kind, key }` |
+| `entitlements.usage.limit_reached` | The first refusal of a metered key in a period, a limit of 0 included | `{ type: "organization", id }` | `{ key, limit, periodEnd }` |
+
+Every event also has `occurredAt`, `actorId` (the staff user for overrides, `null` for syncs and usage) and `organizationId`, which is always set. `data` never holds free text, so an override's `reason` stays out.
+
+## When an event fires
+
+Events fire only for writes that are durable:
+
+- A write outside a transaction, or on an adapter without real transactions, emits as soon as it returns.
+- A write that joined your `runWithTransaction` (an override write, or a sweep) queues its event with better-auth's `queueAfterTransactionHook`. It is handed to `onEvent` once the transaction commits, and dropped if it rolls back.
+- An `onEvent` that throws after the commit is logged and fails nothing.
+
+## Telling owners about a limit
+
+Route `limit_reached` to [`@byo-oss/notifications`](https://github.com/byo-oss/notifications). `auth.api.notify` exists only when that package is installed and its `inbox()` plugin is in `plugins`. Use the event's `type` as the notification `type`, so the inbox's throttling and preferences apply to it:
+
+```ts title="lib/auth.ts"
+import { betterAuth } from "better-auth";
+import { organization } from "better-auth/plugins/organization";
+import { inbox } from "@byo-oss/notifications";
+import { entitlements } from "@byo-oss/entitlements";
+import { catalog } from "./catalog";
+
+export const auth = betterAuth({
+  plugins: [
+    organization(),
+    inbox(),
+    entitlements({
+      catalog,
+      // annotate the return type so TypeScript doesn't infer `auth` from itself
+      onEvent: async (event): Promise<void> => {
+        if (event.type !== "entitlements.usage.limit_reached") return;
+        await auth.api.notify({
+          body: {
+            organizationId: event.organizationId,
+            roles: ["owner", "admin"],
+            type: event.type,
+            title: `You reached your ${event.data.key} limit`,
+            href: "/billing",
+          },
+        });
+      },
+    }),
+  ],
+});
+```
+
+Several consumers can share `onEvent` through `createEventBus` from `@byo-oss/core`. If your app already has a notification layer, route the events through it instead of calling `notify` directly.

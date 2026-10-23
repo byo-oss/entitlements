@@ -1,0 +1,45 @@
+---
+title: Options
+description: The options accepted by entitlements(), with their types and defaults, and the boot checks that refuse a bad value.
+group: reference
+order: 2
+---
+
+`entitlements(options)`. Only `catalog` is required. With nothing else, every organization is on `defaultPlan` (plus overrides) and nothing writes snapshots.
+
+Every duration is in milliseconds except `pastDueGraceDays`, which is in days. A value given in the wrong unit fails boot instead of silently meaning milliseconds: that is what the floors on `maxAge` and the retentions are for.
+
+| Option | Type | Default | Notes |
+|---|---|---|---|
+| `catalog` | `Catalog` | required | From `defineEntitlements`. See [Catalog](/docs/entitlements/catalog) |
+| `source` | `BillingSource` | none | Where billing state comes from, for example `fromBetterAuthStripe()`. Unset: every organization is on `defaultPlan` (plus overrides). See [Billing](/docs/entitlements/billing) |
+| `isEntitled` | `(snapshot, now) => boolean` | `active`, `trialing`, and `past_due` within the grace window | Which snapshots keep their billed plan. Any other status falls back to `defaultPlan` |
+| `pastDueGraceDays` | number (days) | `7` | Days a `past_due` organization keeps its plan, counted from `pastDueSince`, this package's own timestamp. At least 0 |
+| `resolveEntitlements` | `({ organizationId, plan, snapshot, features, limits }) => { features?, limits? }`, sync or async | none | Keys returned replace the plan's values. Runs after a plan override and before feature and limit overrides |
+| `staffOrganizationId` | string | none | The vendor's staff organization, where override permissions are checked. An empty string fails boot. See [Overrides and access](/docs/entitlements/overrides#the-staff-organization) |
+| `authorize` | `({ session, headers, organizationId, permissions }) => boolean \| Promise<boolean>` | organization-role check | Called with the target organization for member reads and with `staffOrganizationId` for staff calls |
+| `acceptSession` | `({ session, headers, kind, method, path }) => boolean \| Promise<boolean>` | refuses impersonated sessions on staff calls and on every POST | `kind` is `"member"` or `"staff"`. `false` answers 403 `SESSION_NOT_ACCEPTED` |
+| `onEvent` | `(event) => void \| Promise<void>` | none | Receives every event; for a write inside a transaction, after the commit. Errors are logged and never fail the call. See [Events](/docs/entitlements/events) |
+| `onError` | `(error, { organizationId, key, operation }) => "allow" \| "deny"` | `() => "deny"` | What `hasFeature`, `consumeUsage` and `checkCapacity` answer when the database or the source throws. Always logged |
+| `cacheTtlMs` | integer (ms) | `30000` | In-process cache of resolved entitlements, at most 10,000 organizations. `0` turns it off. At least 0. Usage counters are never cached |
+| `maxAge` | integer (ms) | `3600000` (1 hour) | A snapshot older than this is served, then refreshed in the background. At least `60000` (1 minute) |
+| `usageRetention` | integer (ms) | `7776000000` (90 days) | The sweep deletes `entitlementUsage` rows whose period ended longer ago. At least `86400000` (1 day) |
+| `overrideRetention` | integer (ms) | `31536000000` (365 days) | The sweep deletes removed or expired overrides that ended longer ago. At least `86400000` (1 day), so `overrideRetention: 365` fails boot |
+| `organizationCleanup` | boolean | `true` | Delete an organization's rows after `/organization/delete`. See [Background work](/docs/entitlements/background#deleting-an-organization) |
+| `maxAttempts` | integer | `5` | Resolve attempts before a snapshot counts as `failed` (it keeps its last good state). At least 1 |
+| `batchSize` | integer | `100` | Rows one sweep call works through: a single budget shared by its steps (resyncs, override expiry, pruning). 1 to 1000 |
+| `leaseMs` | integer (ms) | `300000` (5 minutes) | How long a sweep claim lasts before another sweep may take it. At least 1 |
+| `schema` | | | Rename tables and fields (better-auth's `mergeSchema`). See [Schema](/docs/entitlements/schema) |
+
+## Boot checks
+
+Boot validation throws an error whose message begins `[@byo-oss/entitlements]` for:
+
+- a bad catalog: a missing or unknown key, a bad plan key, a bad limit, a bad alias, more than 150 feature and limit keys, or a `defaultPlan` that isn't a plan (see [Catalog](/docs/entitlements/catalog#rules));
+- an empty `staffOrganizationId`;
+- a `source` without a non-empty `id` or without a `resolve` function, and a source `id` of `"none"`, which is reserved;
+- a numeric option that isn't a number, isn't an integer where one is required, or is out of its range.
+
+A missing `organization()` plugin throws an `Error` whose message contains `ORGANIZATION_PLUGIN_REQUIRED`. `fromBetterAuthStripe()` adds its own checks when it connects, see [Billing](/docs/entitlements/billing#stripe).
+
+Without `staffOrganizationId` and without `authorize`, boot logs one warning: the override endpoints will deny every call.

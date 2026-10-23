@@ -1,0 +1,122 @@
+---
+title: React
+description: The useEntitlements hook, EntitlementGate and UsageMeter, their props and labels, and the Tailwind setup.
+group: guides
+order: 5
+---
+
+`@byo-oss/entitlements/react` has a headless hook and two thin components. Pass your auth client as a prop; there is no global client and no provider.
+
+```tsx title="components/exports.tsx"
+import { EntitlementGate, UsageMeter, useEntitlements } from "@byo-oss/entitlements/react";
+import { authClient } from "../lib/auth-client";
+import { catalog } from "../lib/catalog";
+
+function ExportButton() {
+  return <button type="button">Export</button>;
+}
+
+export function Exports({ organizationId }: { organizationId: string }) {
+  const entitlements = useEntitlements<typeof catalog>({ client: authClient, organizationId });
+  return (
+    <>
+      <EntitlementGate
+        entitlements={entitlements}
+        feature="exports"
+        catalog={catalog}
+        fallback={({ upgradeTo, isLoading }) => (isLoading ? null : <a href="/billing">Upgrade to {upgradeTo[0]}</a>)}
+      >
+        <ExportButton />
+      </EntitlementGate>
+      <UsageMeter entitlements={entitlements} limitKey="apiCalls" catalog={catalog} />
+    </>
+  );
+}
+```
+
+The UI is a convenience, not the gate. Check again on the server with `createEntitlements` before doing the work.
+
+## useEntitlements
+
+`useEntitlements<typeof catalog>({ client, organizationId })` loads `getEntitlements` once per organization and keeps the answer in component state. Pass the catalog's type for typed keys.
+
+| Returns | |
+|---|---|
+| `data` | The last response, with dates as ISO strings, or `null` before the first |
+| `isLoading` | True until the first answer (data or error) for this organization |
+| `error` | An `Error` (with `status` for an HTTP error), or `null` |
+| `hasFeature(key)` | The resolved feature value; `false` while loading |
+| `limit(key)` | The resolved limit, or `null` while loading |
+| `usage(key)` | A metered key's `{ used, remaining, resetAt }`, or `null` while loading |
+| `refresh()` | Calls `refreshEntitlements` (cache bypassed, resolved from the billing source now) and stores the answer |
+
+Call `refresh()` when the user returns from checkout. It keeps the previous data visible while it runs, and a failed call keeps the last good answer for the same organization. Changing `organizationId` starts a new load.
+
+The read endpoint answers 503 `ENTITLEMENTS_UNAVAILABLE` rather than a degraded plan, so the UI never shows the default plan as if it were real: `error` is set instead.
+
+## EntitlementGate
+
+`EntitlementGate` renders `children` when the feature is on, else `fallback(result)`. It renders no markup of its own.
+
+| Prop | |
+|---|---|
+| `entitlements` | What `useEntitlements` returned |
+| `feature` | A feature key |
+| `catalog` | Optional. With it, the fallback's `upgradeTo` lists the plans that include the feature, without the current one. Without it, `upgradeTo` is `[]` |
+| `children` | Shown when the feature is on |
+| `fallback` | `({ allowed: false, key, isLoading, upgradeTo }) => ReactNode`. Without it, nothing is rendered |
+
+The feature counts as off while loading. Return `null` for `isLoading`, as above, or a paying organization sees an upgrade prompt flash before its plan arrives.
+
+## UsageMeter
+
+`UsageMeter` renders a bar for one metered key, with `role="progressbar"`, `aria-valuenow`, `aria-valuemin`, `aria-valuemax` and an `aria-valuetext` such as "920 of 1,000 API calls used today". The text line under it is a polite live region, so a changed count is announced.
+
+| Prop | |
+|---|---|
+| `entitlements` | What `useEntitlements` returned |
+| `limitKey` | A metered key |
+| `catalog` | Optional. Lets the default text name the period ("used today", "this month", "this billing period") |
+| `className` | Classes on the wrapper |
+| `barClassName` | Classes on the filled bar |
+| `textClassName` | Classes added to the text line |
+| `labels` | Overrides any string: `usage`, `loading`, `error` |
+
+While loading it shows an empty, busy bar and `labels.loading`. With an error and no data it shows `labels.error`. For an `"unlimited"` limit the bar stays empty and the text says "(unlimited)".
+
+`labels.usage` gets `{ used, limit, limitKey, period }` and returns the text. The English defaults are exported as `defaultLabels`:
+
+```tsx title="components/meter.tsx"
+import { defaultLabels, UsageMeter, useEntitlements } from "@byo-oss/entitlements/react";
+import { authClient } from "../lib/auth-client";
+import { catalog } from "../lib/catalog";
+
+export function ApiMeter({ organizationId }: { organizationId: string }) {
+  const entitlements = useEntitlements<typeof catalog>({ client: authClient, organizationId });
+  return (
+    <UsageMeter
+      entitlements={entitlements}
+      limitKey="apiCalls"
+      catalog={catalog}
+      labels={{
+        loading: "Checking usage",
+        usage: (input) =>
+          input.limit === "unlimited" ? `${input.used} requests` : defaultLabels.usage(input),
+      }}
+    />
+  );
+}
+```
+
+There are no router links and no repeated elements, so the components take no `onNavigate` or `renderItem`.
+
+## Tailwind and theme tokens
+
+The meter uses shadcn's theme tokens: `bg-muted`, `bg-primary` and `text-muted-foreground`. Define those CSS variables (a shadcn theme does).
+
+Tailwind v4 skips `node_modules` when it scans for classes, so point it at the package from the CSS file that imports Tailwind, with the path relative to that file:
+
+```css title="app.css"
+@import "tailwindcss";
+@source "../node_modules/@byo-oss/entitlements/dist";
+```

@@ -1,0 +1,138 @@
+---
+title: Testing and adapters
+description: Use memorySource in tests, and write a BillingSource for another billing provider and run the contract suite against it.
+group: guides
+order: 8
+---
+
+`@byo-oss/entitlements/testing` has a settable in-memory billing source and the contract suite every `BillingSource` should pass. It is ESM only and needs `vitest`.
+
+## In tests
+
+`memorySource()` stands in for your billing provider. `set` stores a state and resyncs the organization at once, like a provider push:
+
+```ts title="lib/entitlements.test.ts"
+import { betterAuth } from "better-auth";
+import { memoryAdapter } from "better-auth/adapters/memory";
+import { getAuthTables } from "better-auth/db";
+import { organization } from "better-auth/plugins/organization";
+import { createEntitlements, entitlements } from "@byo-oss/entitlements";
+import { memorySource } from "@byo-oss/entitlements/testing";
+import { expect, it } from "vitest";
+import { catalog } from "./catalog";
+
+it("unlocks exports on Pro", async () => {
+  const source = memorySource();
+  const options = {
+    secret: "test_secret",
+    emailAndPassword: { enabled: true },
+    plugins: [organization(), entitlements({ catalog, source })],
+  };
+  // the memory adapter needs one empty array per table
+  const tables: Record<string, object[]> = {};
+  for (const table of Object.keys(getAuthTables(options))) tables[table] = [];
+  const auth = betterAuth({ ...options, database: memoryAdapter(tables) });
+  const { user } = await auth.api.signUpEmail({
+    body: { email: "owner@acme.test", password: "test_secret", name: "Owner" },
+  });
+  const org = await auth.api.createOrganization({ body: { name: "Acme", slug: "acme", userId: user.id } });
+  const gate = createEntitlements(auth, catalog);
+
+  expect((await gate.hasFeature(org.id, "exports")).allowed).toBe(false);
+  await source.set(org.id, { planKey: "pro", status: "active" });
+  expect((await gate.hasFeature(org.id, "exports")).allowed).toBe(true);
+});
+```
+
+| `memorySource` | |
+|---|---|
+| `memorySource({ id?, initial? })` | `id` is `"memory"` by default. `initial` holds states to start with, by organization id |
+| `await source.set(organizationId, state)` | Stores a copy of `state` (`null` clears it) and, once connected, resyncs the organization. Rejects when that resync failed |
+| `source.setFailure(error)` | Makes every `resolve` throw `error`, until called again with `null` |
+
+## Community adapters
+
+A billing provider other than Stripe is a package named `byo-entitlements-<provider>` (for example `byo-entitlements-polar`), or the same under your own scope, that exports a `BillingSource`. No community adapters are known yet. The contract:
+
+- `id` is a non-empty string other than `"none"`. It is stored on snapshots.
+- `resolve(organizationId, { adapter })` returns the current `BillingState` or `null`, reads only through `ctx.adapter`, never mutates its inputs, and throws to retry.
+- `connect(context, changed)`, if present, wires the provider's push. Call `await changed(organizationId)` after a change and let its rejection propagate, so the provider retries. `changed` has already logged it.
+- Moving from a paid state to `null`, or to a state without `periodEnd`, must end on `defaultPlan`.
+
+See [Billing](/docs/entitlements/billing#billing-sources) for the types.
+
+## The contract suite
+
+Run `testBillingSource` against your source, with vitest. `setup` builds a real better-auth with your source and an organization (the catalog needs a plan other than `defaultPlan`), and `failing` builds one whose `resolve` always throws. `failing` is required, so the retry check always runs. Replace the `Map` below with your provider's client:
+
+```ts title="src/source.test.ts"
+import { betterAuth } from "better-auth";
+import { memoryAdapter } from "better-auth/adapters/memory";
+import { getAuthTables } from "better-auth/db";
+import { organization } from "better-auth/plugins/organization";
+import { entitlements, type BillingSource, type BillingState } from "@byo-oss/entitlements";
+import { defineEntitlements } from "@byo-oss/entitlements/catalog";
+import { testBillingSource } from "@byo-oss/entitlements/testing";
+
+const catalog = defineEntitlements({
+  features: ["exports"],
+  limits: { projects: { kind: "capacity" } },
+  plans: {
+    free: { features: { exports: false }, limits: { projects: 3 } },
+    pro: { features: { exports: true }, limits: { projects: "unlimited" } },
+  },
+  defaultPlan: "free",
+});
+
+// stands in for your package's source
+function createSource(states: Map<string, BillingState | null>, failing = false): BillingSource {
+  return {
+    id: "acme",
+    async resolve(organizationId) {
+      if (failing) throw new Error("provider is down");
+      const state = states.get(organizationId);
+      return state ? structuredClone(state) : null;
+    },
+  };
+}
+
+async function build(source: BillingSource) {
+  const options = {
+    secret: "test_secret",
+    emailAndPassword: { enabled: true },
+    plugins: [organization(), entitlements({ catalog, source })],
+  };
+  // the memory adapter needs one empty array per table
+  const tables: Record<string, object[]> = {};
+  for (const table of Object.keys(getAuthTables(options))) tables[table] = [];
+  const auth = betterAuth({ ...options, database: memoryAdapter(tables) });
+  const { user } = await auth.api.signUpEmail({
+    body: { email: "owner@acme.test", password: "test_secret", name: "Owner" },
+  });
+  const created = await auth.api.createOrganization({
+    body: { name: "Acme", slug: "acme", userId: user.id },
+  });
+  return { auth, organizationId: created.id };
+}
+
+testBillingSource({
+  name: "acme source",
+  setup: async () => {
+    const states = new Map<string, BillingState | null>();
+    const source = createSource(states);
+    return {
+      source,
+      ...(await build(source)),
+      setState: async (organizationId, state) => {
+        states.set(organizationId, state);
+      },
+    };
+  },
+  failing: async () => {
+    const source = createSource(new Map(), true);
+    return { source, ...(await build(source)) };
+  },
+});
+```
+
+The suite checks the call shape; `null` for an organization without state; that the state you set comes back; that inputs aren't mutated; that a throwing `resolve` gives a degraded read and persists nothing; that a paid state going to `null`, or to one without `periodEnd`, ends on `defaultPlan`; and that `connect`, when present, is awaited and `changed` resyncs.

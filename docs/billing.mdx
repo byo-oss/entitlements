@@ -1,0 +1,136 @@
+---
+title: Billing
+description: Connect Stripe through @better-auth/stripe or your own BillingSource, and how the billing snapshot stays fresh, when it can be stale, and how past_due grace works.
+group: guides
+order: 3
+---
+
+The billing provider knows which plan an organization bought. This package keeps a snapshot of that in `entitlementSnapshot` and decides what the plan allows. The provider stays the source of truth; the snapshot is a cache of it.
+
+## Billing sources
+
+A `BillingSource` tells the package what an organization has bought. `@byo-oss/entitlements` exports the type:
+
+```ts
+// the shape of BillingSource, which @byo-oss/entitlements exports
+import type { AuthContext, DBTransactionAdapter } from "better-auth";
+import type { BillingState } from "@byo-oss/entitlements";
+
+export interface BillingSource {
+  readonly id: string;
+  resolve(organizationId: string, ctx: { adapter: DBTransactionAdapter }): Promise<BillingState | null>;
+  connect?(context: AuthContext, changed: (organizationId: string) => Promise<void>): void | Promise<void>;
+}
+```
+
+- **`id`** is stored on every snapshot. It must be non-empty and not `"none"`, which stands for "no source". A snapshot whose `source` differs from the configured source's `id` counts as missing, so switching sources resolves every organization again.
+- **`resolve`** returns the current `BillingState`, or `null` for no subscription, and reads through `ctx.adapter`, so a call inside your transaction stays on it. A throw means "try again later": reads fall back to `defaultPlan` with `degraded: true` and the sweep backs off. There is no permanent-failure type, so a source that can't answer never drops an organization's paid plan.
+- **`connect`**, if present, is awaited once in the plugin's `init`. It wires the provider's push: call `await changed(organizationId)` after a change. `changed` resyncs that organization and rejects when the resync failed, so the provider can retry.
+
+`BillingState`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `planKey` | string \| `null` | The provider's plan key, lowercased when stored. A plan or an alias of the catalog |
+| `status` | string \| `null` | The provider's status, verbatim: `active`, `trialing`, `past_due`, … |
+| `periodStart`, `periodEnd` | `Date` \| `null`, optional | The subscription period. A metered `billing` period follows it |
+| `cancelAtPeriodEnd` | boolean, optional | |
+| `seats` | number \| `null`, optional | Paid quantity, when the provider has one |
+| `sourceRef` | string \| `null`, optional | The provider's id for this state, such as a subscription id |
+
+For a provider other than Stripe, see [Testing and adapters](/docs/entitlements/testing#community-adapters).
+
+## Stripe
+
+`fromBetterAuthStripe()` from `@byo-oss/entitlements/stripe` reads the `subscription` table of `@better-auth/stripe` and never writes it. Derive that plugin's `plans` from the catalog with `stripePlans`, so the two can't drift:
+
+```ts title="lib/auth.ts"
+import Stripe from "stripe";
+import { betterAuth } from "better-auth";
+import { organization } from "better-auth/plugins/organization";
+import { stripe } from "@better-auth/stripe";
+import { entitlements } from "@byo-oss/entitlements";
+import { fromBetterAuthStripe, stripePlans } from "@byo-oss/entitlements/stripe";
+import { catalog } from "./catalog";
+import { ac, roles } from "./permissions";
+
+export const auth = betterAuth({
+  plugins: [
+    organization({ ac, roles }),
+    stripe({
+      stripeClient: new Stripe(process.env.STRIPE_SECRET_KEY!),
+      stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET!,
+      organization: { enabled: true },
+      subscription: {
+        enabled: true,
+        plans: stripePlans(catalog, { pro: { priceId: process.env.STRIPE_PRO_PRICE_ID! } }),
+      },
+    }),
+    entitlements({
+      catalog,
+      source: fromBetterAuthStripe(),
+      staffOrganizationId: process.env.STAFF_ORGANIZATION_ID,
+    }),
+  ],
+});
+```
+
+- **`stripePlans(catalog, prices)`** returns one Stripe plan per key in `prices`, in catalog order, with `name` set to the plan key and `limits` to the catalog's limits. Those limits are for the Stripe plugin's own display and are never read back: Stripe holds which plan and status, the catalog holds what the plan allows. A key outside the catalog throws.
+- **The Stripe plugin must be mounted with plans and organizations:** `subscription: { enabled: true, plans }` and `organization: { enabled: true }`. Boot fails when either is off, when the Stripe plugin is missing, or when a Stripe plan name isn't a catalog plan or alias. A plan with `group` logs a warning: one live plan per organization. An app that mounts Stripe without plans passes no `source`.
+- **Webhooks.** The source wraps the Stripe plugin's `onEvent` once. On `checkout.session.completed` and `customer.subscription.created`, `.updated` and `.deleted`, it finds the organization, resyncs it, then calls your own handler. An event for a user, a deleted organization or nothing known resyncs nothing and answers 200. A failed resync throws, so the webhook answers 400 and Stripe redelivers. Create one `stripe()` plugin per `betterAuth()` instance.
+- **Which subscription.** `resolve` picks the entitled one: active, then trialing, then past_due, with the latest `periodEnd` breaking ties. With none, it keeps the latest ended one, so the snapshot records the last status.
+- **Plugin order** against `stripe()` is free: the source connects in `init`. `organization()` still comes first.
+- **The source id** is `"stripe"`. Pass `fromBetterAuthStripe({ id })` to store another one on snapshots.
+
+Call `refreshEntitlements` (or `refresh()` from the React hook) when the user returns from checkout: the webhook may arrive later.
+
+## Entitled statuses and past_due grace
+
+Only an entitled snapshot keeps its billed plan. Every other status, and no subscription, falls back to `defaultPlan`. By default `isEntitled` is true for:
+
+- `active` and `trialing`;
+- `past_due`, for `pastDueGraceDays` (7 by default) counted from `pastDueSince`.
+
+`pastDueSince` is this package's own timestamp: set when a snapshot first sees `past_due`, kept while the status stays `past_due`, cleared otherwise. It doesn't use Stripe's period, which can move forward before payment.
+
+Pass `isEntitled: (snapshot, now) => boolean` to decide yourself. A plan key the catalog doesn't know answers `defaultPlan` and logs one warning per process.
+
+## Adjusting a plan
+
+`resolveEntitlements` lets your app adjust what a plan allows per organization, for example paid seats from Stripe's quantity:
+
+```ts title="lib/auth.ts"
+import { betterAuth } from "better-auth";
+import { organization } from "better-auth/plugins/organization";
+import { entitlements } from "@byo-oss/entitlements";
+import { catalog } from "./catalog";
+
+export const auth = betterAuth({
+  plugins: [
+    organization(),
+    entitlements({
+      catalog,
+      // paid seats override the plan's member limit
+      resolveEntitlements: ({ snapshot }) => (snapshot?.seats ? { limits: { members: snapshot.seats } } : {}),
+    }),
+  ],
+});
+```
+
+It receives `{ organizationId, plan, snapshot, features, limits }` and returns `{ features?, limits? }`, sync or async. Keys it returns replace the plan's values. It runs after a plan override and before feature and limit overrides. A hook that throws degrades the read. Call `invalidate(orgId)` when an app-side input to it changes.
+
+## Freshness
+
+The snapshot is kept fresh five ways:
+
+1. **Push.** A source's events resync one organization at once: the Stripe events above, or `memorySource().set` in tests.
+2. **Read-through.** The first read of an organization with no snapshot resolves from the source and writes one, also when there is no subscription, so the next read is local. Reads inside a transaction resolve without writing.
+3. **Background refresh.** A snapshot older than `maxAge` (1 hour by default) is served, then refreshed: through better-auth's `runInBackground` when `advanced.backgroundTasks.handler` is configured, otherwise by marking it due for the next sweep.
+4. **Sweep.** `processEntitlementsSync` from a cron resyncs due snapshots and backs off on a failing source. See [Background work](/docs/entitlements/background).
+5. **Refresh after checkout.** `refreshEntitlements`, `sync(orgId)` and the hook's `refresh()` bypass the cache and resolve now. Writes the Stripe plugin makes outside its webhook (the `/subscription/success` redirect, upgrade, cancel) are picked up by the next of these.
+
+## Staleness across processes
+
+Each process caches resolved entitlements for up to `cacheTtlMs` (30 seconds by default, at most 10,000 organizations). A process clears its own entry on its own writes (a sync, an override) and on `invalidate(orgId)`. A write made in another process can show up here up to `cacheTtlMs` late. Set `cacheTtlMs: 0` to read through every time. Usage counters are never cached.
+
+`refreshEntitlements` returns the latest state. When a concurrent write wins the race, it reads, resolves and writes again, up to 3 more times, then answers 503 `ENTITLEMENTS_UNAVAILABLE`. A Stripe push that loses the same way answers 400, so Stripe redelivers. `sync(orgId)` throws in that case.

@@ -1,0 +1,110 @@
+---
+title: Background work and lifecycle
+description: Run the sweep from a cron, what each batch does, the delivery guarantees, and what is cleaned up when organizations and users are deleted.
+group: guides
+order: 7
+---
+
+One server-only function does the background work: `processEntitlementsSync`. It resyncs due billing snapshots, expires overrides and prunes old rows. Without a billing source it only expires and prunes, so you need the cron once you configure a `source`.
+
+## The sweep
+
+Call it from a cron, every minute is fine, and again while `hasMore` is true:
+
+```ts title="app/api/cron/entitlements.ts"
+import { auth } from "../../../lib/auth";
+
+export async function GET(): Promise<Response> {
+  let result = await auth.api.processEntitlementsSync();
+  for (let i = 0; result.hasMore && i < 10; i++) {
+    result = await auth.api.processEntitlementsSync();
+  }
+  return Response.json(result);
+}
+```
+
+It returns `{ synced, skipped, retrying, failed, expired, pruned, hasMore }`. It is never an HTTP route.
+
+If you run several BYO plugins, `sweepAll(auth)` from `@byo-oss/core` (add it to your app's own dependencies) calls each installed plugin's sweep (here, `byo.sweep`, which runs the same batch) in plugin order, within a time budget:
+
+```ts title="app/api/cron/route.ts"
+import { sweepAll } from "@byo-oss/core";
+import { auth } from "../../../lib/auth";
+
+export async function GET(): Promise<Response> {
+  const { hasMore, results } = await sweepAll(auth, { budgetMs: 20_000 });
+  return Response.json({ hasMore, results });
+}
+```
+
+## What one batch does
+
+1. **Releases stale claims.** A snapshot claimed longer than `leaseMs` ago (5 minutes by default) goes back to idle: its worker is presumed dead.
+2. **Claims due snapshots**, oldest `nextSyncAt` first, each with a guarded `incrementOne`. A row another sweep claimed first counts as `skipped`.
+3. **Resolves and writes** each claimed snapshot (`synced`). A push or refresh that wrote the row meanwhile wins, and its state stays.
+4. **Backs off** on a throwing source (`retrying`): 1 minute, doubling, capped at `maxAge`. After `maxAttempts` (5 by default) the snapshot counts as `failed`: it keeps its last good state, records `syncError` and is retried every `maxAge`, never frozen. A success resets the attempts.
+5. **Expires overrides** past their `expiresAt` (`expired`).
+6. **Prunes** usage rows whose period ended more than `usageRetention` ago (90 days by default) and removed or expired overrides that ended more than `overrideRetention` ago (365 days by default). Both count as `pruned`.
+
+Steps 1 to 4 run only with a `source`. `batchSize` (100 by default, up to 1000) is one budget for the whole call, shared by the steps in that order, so a call touches at most `batchSize` rows. `hasMore` is true when any step found more rows than the budget left it.
+
+## Inside a transaction
+
+`processEntitlementsSync`, `byo.sweep` and `sweepAll` join your `runWithTransaction` instead of throwing, and roll back with it. The sweep only updates and deletes existing rows, so it can't abort your transaction with a create conflict. Its `plan.changed` events fire after you commit, and never if you roll back.
+
+- Inside a joined transaction the cache entry is cleared before the commit, so a read made outside the transaction in that window can cache the old state again for up to `cacheTtlMs`. Override writes made inside a transaction behave the same way.
+- On Postgres, a database error inside a joined sweep aborts your transaction, so the sweep rejects (it doesn't report `retrying`) and your commit then fails. Run sweeps outside app transactions unless you want them to roll back together.
+
+## Delivery guarantees
+
+- **Syncs** write absolute state, so a repeat is harmless.
+- **`consumeUsage`** counts exactly once per call that returns `allowed`, and refusals never count. A caller that retries a call it believes failed can count twice: there is no idempotency key yet.
+- **Events** are best-effort and at most once, in-process, and fire only for durable writes: after your commit when the write joined a transaction, never on a rollback.
+- **Sweeps** are at-least-once. Each row is claimed atomically with a lease, but a lease that runs out while a slow sweep is still working lets a second sweep claim the same row. The first sweep's write then loses and only the second one's lands, so nothing is lost.
+- **Lifecycle cleanup** failures are logged without failing the response. Run `deleteOrganizationData` to retry.
+
+## Deleting an organization
+
+Deleting an organization through `/organization/delete` removes its usage rows, overrides and snapshot, with no wiring (`organizationCleanup`, on by default). The hook takes the id from the endpoint's response, acts only when the delete succeeded, and logs a failure without failing the request.
+
+For deletes that never go through the organization plugin (a script, an admin tool), call `deleteOrganizationData(auth, organizationId)` yourself. It deletes explicitly, without relying on cascades, joins your transaction when called in one, and is safe to run again:
+
+```ts title="lib/purge.ts"
+import { deleteOrganizationData } from "@byo-oss/entitlements";
+import { auth } from "./auth";
+
+export async function purgeOrganization(organizationId: string): Promise<void> {
+  await deleteOrganizationData(auth, organizationId);
+}
+```
+
+To run the cleanup under your own control, for example with the rest of your organization teardown, turn the automatic hook off and call it from the organization plugin's hook:
+
+```ts title="lib/auth.ts"
+import { betterAuth } from "better-auth";
+import { organization } from "better-auth/plugins/organization";
+import { deleteOrganizationData, entitlements } from "@byo-oss/entitlements";
+import { catalog } from "./catalog";
+
+export const auth = betterAuth({
+  plugins: [
+    organization({
+      organizationHooks: {
+        // annotate the return type so TypeScript doesn't infer `auth` from itself
+        afterDeleteOrganization: async ({ organization }): Promise<void> => {
+          await deleteOrganizationData(auth, organization.id);
+        },
+      },
+    }),
+    entitlements({ catalog, organizationCleanup: false }),
+  ],
+});
+```
+
+With `organizationCleanup: false` and no hook, SQL adapters still cascade through the foreign keys; the memory adapter and MongoDB keep the rows until `deleteOrganizationData` runs. With `@byo-oss/core`, its `deleteOrganizationData(auth, organizationId)` reaches this plugin through `byo.deleteOrganizationData`, so one call cleans every BYO plugin.
+
+## Deleting a user
+
+Deleting a user clears `createdBy` and `removedBy` on the overrides they wrote or removed. A database hook does it, so the memory adapter and MongoDB match SQL's `set null`. Overrides keep their author after that person leaves the staff organization.
+
+Nothing is stored per member, so there is no member cleanup.

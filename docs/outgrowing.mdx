@@ -1,0 +1,52 @@
+---
+title: Outgrowing this
+description: When entitlements stops being the right fit, which tools to look at, how to export your data, and how to move without losing state.
+group: operations
+order: 1
+---
+
+You've outgrown this package when you bill by usage, need credits, rollover or top-ups, sell add-ons across several live plans, need non-engineers to edit plans, or must answer entitlements across regions faster than one database can. The usual next stops are [Stripe Entitlements](https://docs.stripe.com/billing/entitlements) (booleans only: your numeric limits stay in code), [Autumn](https://useautumn.com) (features, limits and usage), [Schematic](https://schematichq.com) and [Stigg](https://www.stigg.io).
+
+## Export
+
+`exportEntitlementsData(auth, options)` returns snapshots, overrides (every status) and usage rows as plain JSON in the [schema](/docs/entitlements/schema), a page at a time. It is server-only, not an endpoint.
+
+```ts title="scripts/export.ts"
+import { writeFile } from "node:fs/promises";
+import { exportEntitlementsData } from "@byo-oss/entitlements";
+import { auth } from "../lib/auth";
+
+export async function exportAll(): Promise<void> {
+  let cursor: string | null = null;
+  let n = 0;
+  do {
+    const page = await exportEntitlementsData(auth, { cursor, limit: 500 });
+    await writeFile(`entitlements-${n++}.json`, JSON.stringify(page));
+    cursor = page.nextCursor;
+  } while (cursor);
+}
+```
+
+- **Options:** `organizationId?` (only that organization's rows; an empty string throws), `cursor?` (the previous page's `nextCursor`) and `limit?` (1 to 1000, default 100).
+- **A page** holds rows of one model, in the order snapshots, overrides, usage; the other two lists are empty. `nextCursor` is `null` after the last page.
+- **Every row** carries `organizationId`. Overrides also carry `createdByEmail` and `removedByEmail` (null when unknown or deleted).
+- **Paging** is an offset over `id` order, so a row deleted mid-export shifts later rows back and one of them can be missed. Export from a quiet database.
+- **The catalog** isn't exported: it is your own code.
+- A malformed cursor throws `[@byo-oss/entitlements] invalid export cursor`. Inside a better-auth transaction, it reads in that transaction.
+
+## Mapping
+
+| Here | Stripe Entitlements | Autumn |
+|---|---|---|
+| A catalog feature | An `entitlements.feature` whose `lookup_key` is the feature key, plus a `product_feature` on each plan's product that includes it | `features.create` with type `boolean`, and the plan `items[]` that include it |
+| A metered limit | No counterpart: keep the number in code | `features.create` with type `metered` (consumable), plan `items[]` with `included` (or `unlimited`) and `reset.interval` from the period |
+| A capacity or value limit | No counterpart: keep the number in code | A plan `items[]` entry carrying the included amount |
+| An override | None | A custom plan, or `balances.create` |
+| Usage rows (`entitlementUsage`) | None | `balances.update` at cut-over |
+
+## Moving over
+
+1. **Run both.** Keep calling `consumeUsage`, and mirror each call to the new tool's `track`.
+2. **Backfill.** Loop `exportEntitlementsData` until `nextCursor` is `null`, and load snapshots, overrides and usage into the new tool.
+3. **Cut over the call sites.** The surface to replace is small: the `createEntitlements` methods and the React hook. That is why app code should never read the tables.
+4. **Uninstall** once nothing calls the old checks. See [Uninstall](/docs/entitlements/uninstall).

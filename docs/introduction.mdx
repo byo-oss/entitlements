@@ -1,0 +1,46 @@
+---
+title: Introduction
+description: Plans, features, limits and usage for better-auth organizations, from one typed catalog, kept in your own database.
+group: get started
+order: 1
+---
+
+`@byo-oss/entitlements` answers one question from anywhere in a [better-auth](https://better-auth.com) app: may this organization do X, and how much of Y is left? You declare a plan catalog once. Stripe (through `@better-auth/stripe`) knows which plan an organization bought. This package keeps a snapshot of that in your database and decides what the plan allows.
+
+> Community plugin — not affiliated with the better-auth team.
+
+## What you get
+
+- **One typed catalog.** Features (booleans), limits (`metered`, `capacity` or `value`) and plans that set every key. The API, the web app and a static pricing page import the same file. See [Catalog](/docs/entitlements/catalog).
+- **Checks that never throw for a refusal.** `hasFeature`, `getLimit`, `consumeUsage` and `checkCapacity` return `allowed`, a `reason` and the plans that would unlock it. An outage answers too, never a 500. See [Checks](/docs/entitlements/checks).
+- **Atomic usage counters.** `consumeUsage` is one guarded `incrementOne`: no read-then-write race, and a refusal never counts.
+- **Billing stays where it is.** `fromBetterAuthStripe()` reads `@better-auth/stripe`'s subscriptions and never writes them. Other providers plug in as a `BillingSource`. See [Billing](/docs/entitlements/billing).
+- **Staff overrides.** Comp a feature, raise or lower a limit, or put an organization on another plan, with a reason, an optional expiry and an audit trail. See [Overrides](/docs/entitlements/overrides).
+- **React pieces.** A headless `useEntitlements` hook, an `EntitlementGate` and a `UsageMeter`. See [React](/docs/entitlements/react).
+- **A way out.** `exportEntitlementsData`, a documented schema and a clean uninstall are part of the package. See [Outgrowing this](/docs/entitlements/outgrowing).
+
+Without a billing source, every organization is on the catalog's default plan (plus overrides). That is enough for development and tests.
+
+## Not included (yet)
+
+Done elsewhere, on purpose:
+
+| Not here | Use |
+|---|---|
+| Checkout, the customer portal, invoices and seat sync to Stripe | `@better-auth/stripe` |
+| Usage-based billing (reporting usage to Stripe Meters) and invoicing | Stripe Billing Meters, Metronome, Orb |
+| Credits, rollover, top-ups, spend limits and reserve/finalize locks | Autumn, Schematic |
+| Abuse rate limits (per IP, per key) | better-auth `rateLimit` |
+| Percentage rollouts and temporary flags | your feature-flag tool |
+| Prices in the catalog | Stripe |
+| Counting seats or members | your app: you pass the count to `checkCapacity` |
+
+Not built yet: user-scoped subscriptions (organizations only for now), add-ons and several live plans per organization, a backfill of every organization's snapshot, a direct Stripe API source for apps without `@better-auth/stripe`, a Polar source, idempotency keys on `consumeUsage`, and scripts that export the catalog to Stripe Entitlements or Autumn.
+
+For when to move to a dedicated tool, see [Outgrowing this](/docs/entitlements/outgrowing).
+
+## Where to go next
+
+- [Quickstart](/docs/entitlements/quickstart) adds the catalog, the plugin, the permissions, the migration and the first check.
+- [Checks](/docs/entitlements/checks) covers what each check answers.
+- [Options](/docs/entitlements/options) and [Schema](/docs/entitlements/schema) list the settings and tables.

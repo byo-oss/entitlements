@@ -1,0 +1,78 @@
+---
+title: Server API
+description: Every endpoint and server function entitlements adds, with its kind, input and what it returns, the error codes, and the exports.
+group: reference
+order: 1
+---
+
+Endpoints are better-auth endpoints. Call them through `auth.api` on the server (with `{ headers, body }` or `{ headers, query }`), or through `authClient.entitlements.*` in the browser. Each is one of the kinds in the [BYO conventions](https://github.com/byo-oss/conventions/blob/main/SPEC.md):
+
+- **gated** needs a session and an `entitlements` permission, in the target organization or the staff organization (see [Overrides and access](/docs/entitlements/overrides#who-may-read));
+- **server-only** is never an HTTP route;
+- **server function** is a plain function you import and call with an organization id. It checks no session, so put your own tenant checks in front of it.
+
+There is no credential-free route.
+
+## Endpoints
+
+| `auth.api` key | Method and path | Kind | Input | Returns |
+|---|---|---|---|---|
+| `getEntitlements` | GET `/entitlements/get` | gated: `entitlements:read` in `organizationId`, or in the staff organization | query `organizationId` | The `get` result plus `usage` per metered key (`{ used, remaining, resetAt }`). Staff callers also get each override's `id`, `reason` and `createdBy` |
+| `refreshEntitlements` | POST `/entitlements/refresh` | gated, same rule | body `organizationId` | The same, after a sync that bypasses the cache. Call it when the user returns from checkout |
+| `setEntitlementOverride` | POST `/entitlements/override/set` | gated: `entitlements:override` in the staff organization | body `organizationId`, `kind`, `key`, `value?`, `reason`, `expiresAt?` (`value` is required for `feature` and `limit` and ignored for `plan`) | `{ override }` |
+| `removeEntitlementOverride` | POST `/entitlements/override/remove` | gated: `entitlements:override` in the staff organization | body `id` | `{ ok: true }` |
+| `listEntitlementOverrides` | GET `/entitlements/overrides` | gated: `entitlements:read` in the staff organization | query `organizationId?`, `status?`, `cursor?` | `{ overrides, nextCursor }`, newest first, up to 50 per page |
+| `processEntitlementsSync` | none | server-only | none | `{ synced, skipped, retrying, failed, expired, pruned, hasMore }`. See [Background work](/docs/entitlements/background) |
+
+The client exposes them as `authClient.entitlements.get({ query })`, `.refresh({ organizationId })`, `.override.set(body)`, `.override.remove({ id })` and `.overrides({ query })`. Over HTTP, dates arrive as ISO strings; the `Wire<T>` type describes that shape.
+
+`getEntitlements` and `refreshEntitlements` answer 503 `ENTITLEMENTS_UNAVAILABLE` instead of a degraded plan, so a UI never shows the default plan as if it were real. `refreshEntitlements` inside a transaction throws instead.
+
+The override endpoints accept any body and check it after the staff gate, so a caller without access always gets 404, whatever it sends. An unauthenticated call answers 401.
+
+## Server functions
+
+`createEntitlements(auth, catalog)` returns the first eight, typed by your catalog. `deleteOrganizationData` and `exportEntitlementsData` are separate imports from `@byo-oss/entitlements`.
+
+| Function | Kind | Returns |
+|---|---|---|
+| `get(orgId)` | server function | `organizationId`, `plan` (`key`, `display`, `source`), `status`, `periodEnd`, `cancelAtPeriodEnd`, `features`, `limits`, the applied `overrides` (`{ kind, key, expiresAt }`), `degraded` |
+| `getMany(orgIds)` | server function | `get` for up to 1000 ids, in order |
+| `hasFeature(orgId, feature)` | server function | `{ allowed, reason, key, plan, upgradeTo }` |
+| `getLimit(orgId, key)` | server function | `{ key, plan, limit, allowed, reason, upgradeTo, degraded }`; metered keys add `{ used, remaining, resetAt }` |
+| `consumeUsage(orgId, key, { amount? })` | server function | `{ allowed, reason, key, used, limit, remaining, resetAt, firstRefusal, plan, upgradeTo }` |
+| `checkCapacity(orgId, key, { count, adding? })` | server function | `{ allowed, reason, key, count, limit, over, plan, upgradeTo }` |
+| `sync(orgId)` | server function | The fresh `get` result. Throws on failure |
+| `invalidate(orgId)` | server function | Nothing. Clears this process's cache entry |
+| `deleteOrganizationData(auth, orgId)` | server function | Nothing. Deletes the organization's rows, see [Background work](/docs/entitlements/background#deleting-an-organization) |
+| `exportEntitlementsData(auth, options)` | server function | One page of rows, see [Outgrowing this](/docs/entitlements/outgrowing#export) |
+
+What each check answers, and what throws, is in [Checks](/docs/entitlements/checks).
+
+## Error codes
+
+`ENTITLEMENTS_ERROR_CODES` is exported and set as the plugin's `$ERROR_CODES`. Responses are `{ code, message }`.
+
+| Code | Status | When |
+|---|---|---|
+| `ORGANIZATION_PLUGIN_REQUIRED` | thrown at boot | `organization()` is not in `plugins` |
+| `ORGANIZATION_NOT_FOUND` | 404 | Every gate failure, and any unknown organization |
+| `SESSION_NOT_ACCEPTED` | 403 | `acceptSession` returned `false` |
+| `NOT_ALLOWED` | 403 | Reserved; gates answer 404 |
+| `INVALID_OVERRIDE` | 400 | An override failed validation |
+| `OVERRIDE_NOT_FOUND` | 404 | Removing a missing or non-active override |
+| `ENTITLEMENTS_UNAVAILABLE` | 503 | A degraded read, a sync that threw, or a usage read that threw |
+| `INVALID_CURSOR` | 400 | A malformed list cursor, or a page past the tie bound |
+| `UNKNOWN_KEY` | thrown `Error`, not HTTP | A key of the wrong kind from untyped callers |
+
+## Exports
+
+From the root, `@byo-oss/entitlements` exports `entitlements`, `createEntitlements`, `deleteOrganizationData`, `exportEntitlementsData`, `entitlementsStatements`, `ENTITLEMENTS_ERROR_CODES`, `ENTITLEMENTS_EVENT_TYPES`, `defineEntitlements`, `upgradeTo`, and the types: `EntitlementsOptions`, `BillingSource`, `BillingState`, `EntitlementsResult`, the check results, `EntitlementsEvent`, the row types and the rest.
+
+| Import | Exports |
+|---|---|
+| `@byo-oss/entitlements/catalog` | `defineEntitlements`, `upgradeTo` and the catalog types (`Catalog`, `FeatureKey`, `LimitKey`, `MeteredKey`, `CapacityKey`, `ValueKey`, `PlanKey`, …). Imports nothing |
+| `@byo-oss/entitlements/client` | `entitlementsClient`, the catalog helpers and types, `entitlementsStatements`, and the response types `EntitlementsResponse`, `EntitlementOverride`, `ListOverridesResponse`, `UsageInfo` and `Wire` |
+| `@byo-oss/entitlements/react` | `useEntitlements`, `EntitlementGate`, `UsageMeter` and `defaultLabels` |
+| `@byo-oss/entitlements/stripe` | `fromBetterAuthStripe` and `stripePlans` |
+| `@byo-oss/entitlements/testing` | `memorySource` and `testBillingSource` (ESM only, needs `vitest`) |

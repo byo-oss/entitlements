@@ -1,21 +1,29 @@
 #!/usr/bin/env node
 /**
  * Docs samples compile: every ```ts / ```tsx block in README.md, AGENTS.md,
- * llms.txt and skills/**\/SKILL.md must typecheck when pasted, imports
- * included (no shorthand, no fragments).
+ * llms.txt, skills/**\/SKILL.md and the byo.dev pages in docs/*.mdx must
+ * typecheck when pasted, imports included (no shorthand, no fragments).
  *
  * Each block is written to a scratch directory under the OS temp dir and
  * checked with tsc (strict) against the package's built types:
  * `@byo-oss/entitlements*` resolves to ./dist, everything else to this
  * repo's node_modules. Run `pnpm build` first.
  *
- * Files per document form one small project. A block whose first line is a
- * path comment (`// lib/catalog.ts`) is written at that path, so a later
- * block can `import { catalog } from "./catalog"`. Other blocks stand alone.
+ * Files per document form one small project. A block whose fence has a
+ * `title="lib/catalog.ts"` (how docs/*.mdx names files; the site shows it as
+ * the block's tab), or whose first line is a path comment
+ * (`// lib/catalog.ts`, how the README does it), is written at that path, so
+ * a later block can `import { catalog } from "./catalog"`. Other blocks
+ * stand alone.
+ *
+ * Each docs/*.mdx page is its own project, seeded with the named files of
+ * docs/quickstart.mdx (`lib/catalog.ts`, `lib/auth.ts`, `lib/gate.ts`, …),
+ * so any page can import them. A page's own block at the same path wins.
  *
  * A block tagged ```ts nocheck is skipped. Use it sparingly, only for an
  * illustrative fragment, and say why in a `// nocheck: <reason>` comment line
- * inside the block.
+ * inside the block. On byo.dev that comment line is shown, so prefer a
+ * complete block in docs/*.mdx.
  *
  *   node scripts/check-docs-samples.mjs
  *   node scripts/check-docs-samples.mjs --keep       (keep the scratch dir)
@@ -49,6 +57,9 @@ const SELF_TYPES = {
   "@byo-oss/entitlements/testing": "dist/testing.d.ts",
 };
 
+/** The docs page whose named files seed every other page's project. */
+const QUICKSTART = "docs/quickstart.mdx";
+
 /** Documents to scan, relative to the repo root. */
 function documents(root) {
   const docs = ["README.md", "AGENTS.md", "llms.txt"];
@@ -58,6 +69,12 @@ function documents(root) {
       if (basename(String(entry)) === "SKILL.md") {
         docs.push(posix.join("skills", String(entry).split("\\").join("/")));
       }
+    }
+  }
+  const pages = join(root, "docs");
+  if (existsSync(pages)) {
+    for (const entry of readdirSync(pages).sort()) {
+      if (entry.endsWith(".mdx")) docs.push(posix.join("docs", entry));
     }
   }
   return docs.filter((doc) => existsSync(join(root, doc)));
@@ -92,6 +109,7 @@ export function extractBlocks(text) {
       lang,
       line: i + 2,
       code: body.join("\n"),
+      info: (open[3] ?? "").trim(),
       nocheck: info.includes("nocheck"),
     });
     i = j;
@@ -99,16 +117,33 @@ export function extractBlocks(text) {
   return blocks;
 }
 
+/** A relative `.ts`/`.tsx` path inside the scratch project, or null. */
+function safePath(path) {
+  if (!path || path.startsWith("/") || path.split("/").includes("..")) {
+    return null;
+  }
+  return path;
+}
+
 /** `// lib/catalog.ts` on the first line names the block's file. */
 export function pathComment(code) {
   const m = /^\/\/\s*((?:[\w.-]+\/)*[\w.-]+\.tsx?)\b/.exec(
     code.split("\n")[0] ?? "",
   );
-  const path = m?.[1];
-  if (!path || path.startsWith("/") || path.split("/").includes("..")) {
-    return null;
-  }
-  return path;
+  return safePath(m?.[1]);
+}
+
+/** `title="lib/catalog.ts"` in a fence's info string names the block's file. */
+export function titlePath(info) {
+  const m = /title="([^"]+)"/.exec(info ?? "");
+  const title = m?.[1];
+  if (!title || !/^(?:[\w.-]+\/)*[\w.-]+\.tsx?$/.test(title)) return null;
+  return safePath(title);
+}
+
+/** The file a block is written at, if it names one: its title, else its path comment. */
+export function blockPath(block) {
+  return titlePath(block.info) ?? pathComment(block.code);
 }
 
 const slug = (doc) => doc.replace(/[^\w]+/g, "-").replace(/^-|-$/g, "");
@@ -128,10 +163,16 @@ function selfTest() {
     "```css",
     "a {}",
     "```",
+    '```ts title="lib/auth.ts"',
+    "export const b = 2",
+    "```",
+    '```ts title="../x.ts"',
+    "export const c = 3",
+    "```",
   ].join("\n");
   const blocks = extractBlocks(text);
   const checks = [
-    ["finds ts and tsx blocks only", blocks.length === 2],
+    ["finds ts and tsx blocks only", blocks.length === 4],
     ["first block starts on its first code line", blocks[0]?.line === 3],
     [
       "path comment names the file",
@@ -144,6 +185,20 @@ function selfTest() {
     ],
     ["a plain comment is not a path", pathComment("// not a path") === null],
     ["a parent path is refused", pathComment("// ../x.ts") === null],
+    [
+      "a fence title names the file",
+      blockPath(blocks[2] ?? {}) === "lib/auth.ts",
+    ],
+    [
+      "a title wins over a path comment",
+      blockPath({ info: 'title="lib/b.ts"', code: "// lib/a.ts" }) ===
+        "lib/b.ts",
+    ],
+    ["a parent path title is refused", blockPath(blocks[3] ?? {}) === null],
+    [
+      "a title that isn't a ts file names nothing",
+      titlePath('title="terminal"') === null,
+    ],
   ];
   let ok = true;
   for (const [name, pass] of checks) {
@@ -180,9 +235,38 @@ function main() {
 
   const problems = [];
   const origin = new Map(); // scratch file (posix, relative) -> { doc, line }
+  const counts = new Map(); // doc -> { checked, skipped }
   let checked = 0;
   let skipped = 0;
-  for (const doc of documents(ROOT)) {
+
+  const write = (file, code, at) => {
+    const target = join(scratch, ...file.split("/"));
+    mkdirSync(dirname(target), { recursive: true });
+    // `export {}` makes a block without imports a module, so blocks never
+    // share a global scope
+    writeFileSync(target, `${code}\nexport {}\n`);
+    origin.set(file, at);
+  };
+
+  const docs = documents(ROOT);
+  // the quickstart's named files, written into every other page's project
+  const seed = [];
+  if (docs.includes(QUICKSTART)) {
+    try {
+      const text = readFileSync(join(ROOT, QUICKSTART), "utf8");
+      const named = new Set();
+      for (const block of extractBlocks(text)) {
+        const rel = blockPath(block);
+        if (block.nocheck || !rel || named.has(rel)) continue;
+        named.add(rel);
+        seed.push({ rel, code: block.code, line: block.line });
+      }
+    } catch {
+      // reported below, when the quickstart itself is read
+    }
+  }
+
+  for (const doc of docs) {
     let blocks;
     try {
       blocks = extractBlocks(readFileSync(join(ROOT, doc), "utf8"));
@@ -190,10 +274,13 @@ function main() {
       problems.push(`${doc}: ${error.message}`);
       continue;
     }
+    const count = { checked: 0, skipped: 0 };
+    counts.set(doc, count);
     const used = new Set();
     for (const block of blocks) {
       if (block.nocheck) {
         skipped++;
+        count.skipped++;
         if (!/^\s*\/\/.*nocheck/m.test(block.code)) {
           problems.push(
             `${doc}:${block.line}: a nocheck block needs a "// nocheck: <why>" comment line inside it`,
@@ -202,18 +289,22 @@ function main() {
         continue;
       }
       const ext = block.lang === "tsx" ? "tsx" : "ts";
-      let rel = pathComment(block.code) ?? `snippets/line-${block.line}.${ext}`;
+      let rel = blockPath(block) ?? `snippets/line-${block.line}.${ext}`;
       if (used.has(rel))
         rel = rel.replace(/(\.tsx?)$/, `-line-${block.line}$1`);
       used.add(rel);
-      const file = posix.join(slug(doc), rel);
-      const target = join(scratch, ...file.split("/"));
-      mkdirSync(dirname(target), { recursive: true });
-      // `export {}` makes a block without imports a module, so blocks never
-      // share a global scope
-      writeFileSync(target, `${block.code}\nexport {}\n`);
-      origin.set(file, { doc, line: block.line });
+      write(posix.join(slug(doc), rel), block.code, { doc, line: block.line });
       checked++;
+      count.checked++;
+    }
+    if (doc.startsWith("docs/") && doc !== QUICKSTART) {
+      for (const file of seed) {
+        if (used.has(file.rel)) continue; // the page's own block wins
+        write(posix.join(slug(doc), file.rel), file.code, {
+          doc: QUICKSTART,
+          line: file.line,
+        });
+      }
     }
   }
 
@@ -280,8 +371,14 @@ function main() {
   if (keep) console.error(`check-docs-samples: scratch kept at ${scratch}`);
   else rmSync(scratch, { recursive: true, force: true });
 
-  for (const problem of problems)
+  // a seeded quickstart file fails once per page that imports it: report it once
+  for (const problem of new Set(problems))
     console.error(`check-docs-samples: ${problem}`);
+  for (const [doc, count] of counts) {
+    console.log(
+      `check-docs-samples:   ${doc}: ${count.checked} checked, ${count.skipped} skipped`,
+    );
+  }
   const summary = `${checked} block(s) checked, ${skipped} skipped (nocheck)`;
   if (problems.length > 0) {
     console.error(`check-docs-samples: FAILED, ${summary}`);

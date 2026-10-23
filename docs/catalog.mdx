@@ -1,0 +1,114 @@
+---
+title: Catalog
+description: Declare features, limits and plans once with defineEntitlements, and import the same typed catalog on the server, in the web app and on a static pricing page.
+group: guides
+order: 1
+---
+
+The catalog is plain data you declare once with `defineEntitlements`. Feature, limit and plan keys become string-literal types, so a typo in a check is a type error, and the plugin checks the catalog again at boot.
+
+## Features, limits and plans
+
+```ts title="lib/catalog.ts"
+import { defineEntitlements } from "@byo-oss/entitlements/catalog";
+
+export const catalog = defineEntitlements({
+  features: ["exports", "sso"],
+  limits: {
+    apiCalls: { kind: "metered", period: "month" },
+    seats: { kind: "capacity" },
+    retentionDays: { kind: "value" },
+  },
+  plans: {
+    free: {
+      features: { exports: false, sso: false },
+      limits: { apiCalls: 1_000, seats: 3, retentionDays: 7 },
+      display: { name: "Free", tagline: "For trying it out" },
+    },
+    team: {
+      features: { exports: true, sso: false },
+      limits: { apiCalls: 50_000, seats: 25, retentionDays: 90 },
+      display: { name: "Team", tagline: "For growing teams" },
+    },
+    enterprise: {
+      features: { exports: true, sso: true },
+      limits: { apiCalls: "unlimited", seats: "unlimited", retentionDays: 365 },
+      display: { name: "Enterprise", tagline: "Talk to us" },
+    },
+  },
+  defaultPlan: "free",
+  planAliases: { pro: "team" },
+});
+```
+
+- **Features** are booleans.
+- **Limits** are non-negative integers or `"unlimited"`. A limit of 0 means "not included": every check answers it with `reason: "not_in_plan"`.
+- **Plans** set every feature and every limit, and nothing else. A missing or unknown key is a type error and a boot error.
+- **`defaultPlan`** is the plan of an organization without a subscription, and the answer when something fails.
+- **`planAliases`** map an old plan key, still on subscriptions in Stripe, to a current plan. Never rename a plan key that has subscribers: add an alias instead. An alias can't share a key with a plan.
+
+## Kinds of limit
+
+| Kind | Checked with | What it is |
+|---|---|---|
+| `metered` | `consumeUsage`, `getLimit` | A counter per period, kept by this package. `period` is `day` or `month` (UTC calendar periods) or `billing` |
+| `capacity` | `checkCapacity`, `getLimit` | A ceiling on something your app counts, such as projects or seats. You pass the current count |
+| `value` | `getLimit` | A plan setting, such as `retentionDays` |
+
+A `billing` period follows the snapshot's subscription period (`periodStart` to `periodEnd`) while the organization is entitled and inside it. Otherwise it is the UTC month, so an ended subscription doesn't keep counting into an old period.
+
+For seats, count members, plus pending invitations when they hold a seat. Skip expired invitations: better-auth leaves an invitation at `status: "pending"` after it expires, so also require `expiresAt` to be in the future.
+
+## Rules
+
+- Plan keys (and alias keys) match `/^[a-z][a-z0-9_-]*$/`, because `@better-auth/stripe` lowercases plan names.
+- Features are unique, non-empty strings, and no key is both a feature and a limit.
+- At most 150 feature and limit keys together.
+- At least one plan, and `defaultPlan` is one of them.
+- A plan has only `features`, `limits` and an optional `display`.
+
+`defineEntitlements` throws `[@byo-oss/entitlements] …` for the first rule a catalog breaks, and the plugin runs the same checks at boot.
+
+## Display copy
+
+`display` is free-form metadata, returned as given: names, taglines, highlight flags. Each plan keeps its own `display` type, so a pricing page reads `catalog.plans.team.display.name` typed. Prices are not part of the catalog: they live in Stripe.
+
+## Upgrade targets
+
+`upgradeTo` returns the plan keys, in catalog order, that include a feature or have at least a given amount of a limit (`"unlimited"` counts):
+
+```ts title="lib/pricing.ts"
+import { upgradeTo } from "@byo-oss/entitlements/catalog";
+import { catalog } from "./catalog";
+
+export const ssoPlans = upgradeTo(catalog, { feature: "sso" }); // ["enterprise"]
+export const fiftySeats = upgradeTo(catalog, { limit: "seats", atLeast: 50 }); // ["enterprise"]
+```
+
+This lists every plan that qualifies. The `upgradeTo` on a check result is narrower: only plans strictly better on that key than the organization's current plan.
+
+## In the browser and on a static site
+
+`@byo-oss/entitlements/catalog` imports nothing, so the catalog file is safe in any bundle. A pricing page can render straight from it:
+
+```tsx title="components/pricing.tsx"
+import { catalog } from "../lib/catalog";
+
+export function Pricing() {
+  return (
+    <ul>
+      {Object.entries(catalog.plans).map(([key, plan]) => (
+        <li key={key}>
+          {plan.display.name}: {plan.display.tagline}, {String(plan.limits.seats)} seats
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+`@byo-oss/entitlements/client` and the root re-export `defineEntitlements` and `upgradeTo`, so client code can import them from there too.
+
+## One catalog for the plugin and the API
+
+Pass the same catalog to `entitlements({ catalog })` and to `createEntitlements(auth, catalog)`. The first call through `createEntitlements` compares them, by reference and then by deep equality. A different catalog throws `[@byo-oss/entitlements] createEntitlements got a different catalog than the plugin`.

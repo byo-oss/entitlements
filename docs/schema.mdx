@@ -1,0 +1,75 @@
+---
+title: Schema
+description: The three tables entitlements creates, their fields and types, the indexes it declares, and the unique indexes MongoDB needs.
+group: reference
+order: 3
+---
+
+Entitlements creates three tables. They are a public contract for migrations and exports. Rename tables or fields with the `schema` option. Each references `organization` with `onDelete: "cascade"`, and `user` references use `set null`. Nothing is added to better-auth's own tables (`user`, `organization`, `member`) or to the Stripe plugin's. None of the three references another.
+
+**Don't read these tables from app code.** Gate through `createEntitlements`, `auth.api.*` and the client, so the day you move to another tool only those call sites change.
+
+## entitlementSnapshot
+
+One row per organization: the cached billing state.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | string | Primary key |
+| `organizationId` | string → `organization.id`, cascade, unique | |
+| `source` | string | The source's `id`, or `"none"`. A row whose `source` differs from the configured source's `id` counts as missing |
+| `planKey` | string, optional | The source's plan key, lowercased. Null: no subscription |
+| `status` | string, optional | The provider's status, verbatim |
+| `periodStart`, `periodEnd` | date, optional | The subscription period |
+| `cancelAtPeriodEnd` | boolean | Default `false` |
+| `seats` | number, optional | Paid quantity, when the provider has one |
+| `pastDueSince` | date, optional | When this snapshot first saw `past_due`; null otherwise. The grace clock |
+| `sourceRef` | string, optional | The provider's id, for example the Stripe subscription id |
+| `version` | number | Default 0. Every state write and every sweep claim increments it; a writer whose read is outdated loses and retries |
+| `syncedAt` | date | The last successful resolve |
+| `nextSyncAt` | date, indexed | When the sweep should resync |
+| `syncState` | string | `idle` (the default) or `syncing`: the sweep's claim |
+| `syncClaimedAt` | date, optional | When the claim started (the lease) |
+| `syncAttempts` | number | Default 0. Reset on success |
+| `syncError` | string, optional | The last error, up to 1000 characters. Cleared on the next success |
+| `createdAt`, `updatedAt` | date | |
+
+## entitlementOverride
+
+Staff grants, kept after they end.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | string | Primary key |
+| `organizationId` | string → `organization.id`, cascade, indexed | |
+| `status` | string, indexed | `active`, `removed` or `expired` |
+| `kind` | string | `plan`, `feature` or `limit` |
+| `key` | string | A plan, feature or limit key |
+| `value` | string | JSON: plan `null`; feature `true` or `false`; limit a non-negative integer or `"unlimited"`. A value that doesn't decode for its kind is ignored |
+| `reason` | string | Required, 1 to 500 characters |
+| `permanent` | boolean | True when `expiresAt` is null |
+| `expiresAt` | date, optional | Null: until removed |
+| `endedAt` | date, optional | Set when removed or expired |
+| `createdBy`, `removedBy` | string → `user.id`, set null, optional, indexed | The staff user who set or removed it |
+| `createdAt` | date | |
+
+## entitlementUsage
+
+One counter per organization, metered key and period.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `id` | string | Primary key |
+| `bucket` | string, unique | `${organizationId}:${key}:${periodStart ISO}`: the race-safe lookup key |
+| `organizationId` | string → `organization.id`, cascade, indexed | |
+| `key` | string | The metered limit key |
+| `periodStart`, `periodEnd` | date | `periodEnd` is indexed, for the retention prune |
+| `used` | number | Default 0 |
+| `refused` | number | Default 0. Refusals this period; the first one emits `limit_reached` |
+| `createdAt`, `updatedAt` | date | |
+
+## MongoDB
+
+The indexes are declared on the plugin schema (`index: true`, `unique: true`). MongoDB's better-auth adapter creates no unique indexes from the schema, so create two yourself before the first write: `entitlementSnapshot.organizationId` and `entitlementUsage.bucket`, both unique. Without them, concurrent first writes from several processes can create duplicates and over-allow.
+
+Without foreign keys, deleting organizations and users goes through the cleanup described in [Background work](/docs/entitlements/background#deleting-an-organization).

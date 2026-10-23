@@ -1,0 +1,20 @@
+---
+title: Uninstall
+description: How to remove entitlements, its client plugin, components and cron, and drop the three tables it created.
+group: operations
+order: 2
+---
+
+Remove `entitlements()` from `betterAuth({ plugins })`. Keep `organization()` if you use it for anything else. If you used `stripePlans`, replace it with a plain `plans` array: the Stripe plugin keeps working. Then remove `entitlementsClient()` from your auth client, the `/react` components and the hook from your UI, the cron that calls `processEntitlementsSync`, the `entitlements` statements from your access control, and the Tailwind `@source` line.
+
+Then drop the tables. Use the names your adapter or the `schema` option gave them. The quotes keep the camelCase names (MySQL uses backticks):
+
+```sql
+DROP TABLE IF EXISTS "entitlementUsage";
+DROP TABLE IF EXISTS "entitlementOverride";
+DROP TABLE IF EXISTS "entitlementSnapshot";
+```
+
+None references another, so any order works.
+
+The plugin adds no columns to better-auth's own tables (`user`, `organization`, `member`) or to the Stripe plugin's, so there is nothing else to clean up.

@@ -1,0 +1,156 @@
+---
+title: Checks
+description: Gate features, read limits, consume usage and check capacity with createEntitlements, and how refusals, outages and transactions are answered.
+group: guides
+order: 2
+---
+
+`createEntitlements(auth, catalog)` returns the server API, typed by your catalog. Every method takes a plain organization id, so you can wrap it behind your own tenant checks. Reads and checks never throw for a refusal or an outage: they return a result you build the response from.
+
+```ts title="lib/gate.ts"
+import { createEntitlements } from "@byo-oss/entitlements";
+import { auth } from "./auth";
+import { catalog } from "./catalog";
+
+export const gate = createEntitlements(auth, catalog);
+```
+
+## The methods
+
+| Method | Returns |
+|---|---|
+| `get(orgId)` | `plan` (`key`, `display`, `source`: `"billing"`, `"default"` or `"override"`), `status`, `periodEnd`, `cancelAtPeriodEnd`, `features`, `limits`, the applied `overrides`, `degraded` |
+| `getMany(orgIds)` | `get` for up to 1000 ids, in the order given. `[]` returns `[]` with no query; more than 1000 throws |
+| `hasFeature(orgId, feature)` | `{ allowed, reason, key, plan, upgradeTo }` |
+| `getLimit(orgId, key)` | `{ key, plan, limit, allowed, reason, upgradeTo, degraded }`. Metered keys add `{ used, remaining, resetAt }`. Consumes nothing |
+| `consumeUsage(orgId, key, { amount? })` | `{ allowed, reason, key, used, limit, remaining, resetAt, firstRefusal, plan, upgradeTo }`. Metered keys only; `amount` is a positive integer, 1 by default |
+| `checkCapacity(orgId, key, { count, adding? })` | `{ allowed, reason, key, count, limit, over, plan, upgradeTo }`. Capacity keys only; `adding` is 1 by default |
+| `sync(orgId)` | Resyncs from the billing source now and returns the fresh `get` result. See [Billing](/docs/entitlements/billing#freshness) |
+| `invalidate(orgId)` | Clears this process's cache entry for the organization |
+
+`reason` is `"ok"`, `"not_in_plan"`, `"limit_reached"` or `"error"`.
+
+## Features
+
+```ts title="lib/exports.ts"
+import { gate } from "./gate";
+
+export async function exportProjects(organizationId: string): Promise<Response> {
+  const check = await gate.hasFeature(organizationId, "exports");
+  if (!check.allowed) {
+    return Response.json({ error: "upgrade_required", plans: check.upgradeTo }, { status: 403 });
+  }
+  return Response.json({ ok: true });
+}
+```
+
+## Limits and usage
+
+`consumeUsage` counts against a metered limit. It is one `incrementOne` guarded on `used <= limit - amount`, so the count and the limit check happen in one statement, and a refused call never counts. This guard sets the `ratelimit-*` headers on every call:
+
+```ts title="lib/guard.ts"
+import { gate } from "./gate";
+
+// Pass the response headers so a successful call can carry the ratelimit-* headers too.
+export async function guardApiCall(organizationId: string, headers: Headers): Promise<Response | null> {
+  const r = await gate.consumeUsage(organizationId, "apiCalls");
+  const reset = String(Math.ceil((r.resetAt.getTime() - Date.now()) / 1000));
+  // `limit` and `remaining` are numbers or "unlimited" (an override can lift the cap)
+  if (typeof r.limit === "number" && typeof r.remaining === "number") {
+    headers.set("ratelimit-limit", String(r.limit));
+    headers.set("ratelimit-remaining", String(r.remaining));
+    headers.set("ratelimit-reset", reset);
+  }
+  if (r.allowed) return null;
+  headers.set("retry-after", reset);
+  return new Response("Limit reached", { status: r.reason === "error" ? 503 : 429, headers });
+}
+```
+
+- `resetAt` is when the current period ends and the counter starts again.
+- `firstRefusal` is true for the first refusal of the key in its period. That refusal also emits `entitlements.usage.limit_reached` (see [Events](/docs/entitlements/events)).
+- `getLimit` reads a limit of any kind without consuming. On a metered key it answers `limit_reached` when nothing is left.
+- A retried call can count twice: there is no idempotency key yet.
+
+How exact the guard is depends on the adapter:
+
+| Adapter | Guarantee |
+|---|---|
+| Kysely, Drizzle | The guard is re-applied on the `UPDATE` itself: exact |
+| Memory, Prisma, MongoDB | Native guarded increment: exact |
+| A custom adapter without its own `incrementOne` | better-auth's fallback guards on the prior value and retries 5 times, then throws. Under contention `consumeUsage` answers `onError` (deny by default) rather than over-allowing |
+
+better-auth before 1.7.7 guards only a subquery on Postgres, which is why the peer floor is `^1.7.7`.
+
+## Capacity
+
+`checkCapacity` compares a count you supply with a capacity limit: `allowed` is `count + adding <= limit`, and `"unlimited"` always allows. `over` is true while `count > limit`, for example after a downgrade, so a UI can show the organization above its new limit. Nothing is deleted.
+
+```ts title="lib/projects.ts"
+import { gate } from "./gate";
+
+export async function canCreateProject(organizationId: string, currentCount: number) {
+  const check = await gate.checkCapacity(organizationId, "projects", { count: currentCount });
+  return check.allowed ? { ok: true as const } : { ok: false as const, upgradeTo: check.upgradeTo };
+}
+```
+
+Because the count is yours, two concurrent creates can both pass. To close that race, lock a parent row (`SELECT … FOR UPDATE` on the organization) inside the transaction that counts and creates, or use SERIALIZABLE. `checkCapacity` works inside a transaction.
+
+## Result rules
+
+- **A limit of 0 means "not included".** `getLimit`, `consumeUsage` and `checkCapacity` answer `reason: "not_in_plan"`. A metered refusal still counts toward `refused`, and the first one in a period emits `limit_reached`.
+- **`upgradeTo` lists only plans strictly better on that key** than the organization's current plan, in catalog order. It never names the current plan or a cheaper one, and it is `[]` on an error.
+- **Results are read-only.** The result types are `Readonly`. A cached `get` result is deep-frozen and shared, so copy one before changing it. Check results and degraded results are fresh objects, and every `Date` in a result is a fresh copy.
+
+## Refusals, outages and bad arguments
+
+When the database, the billing source or your `resolveEntitlements` hook throws:
+
+- `get`, `getMany` and `getLimit` answer from `defaultPlan` with `degraded: true` (`getLimit` also with `allowed: false` and `reason: "error"`);
+- `hasFeature`, `consumeUsage` and `checkCapacity` answer what `onError` says (deny by default) with `reason: "error"`;
+- each failure is logged once.
+
+An id that isn't an organization answers `defaultPlan` without `degraded` and writes nothing. `consumeUsage` refuses it with `not_in_plan` and creates no counter.
+
+Bad arguments are programmer errors, and they throw:
+
+| Mistake | Throws |
+|---|---|
+| A key of the wrong kind, such as a feature where a metered key is expected | `[@byo-oss/entitlements] UNKNOWN_KEY: …` |
+| An `amount` that isn't a positive integer | `[@byo-oss/entitlements] consumeUsage: amount must be a positive integer` |
+| A `count` or `adding` that isn't a non-negative integer | `[@byo-oss/entitlements] checkCapacity: count and adding must be non-negative integers` |
+| More than 1000 ids to `getMany` | `[@byo-oss/entitlements] getMany takes at most 1000 organization ids` |
+
+`sync` is the exception to "never throws": it throws when the source or the database fails, for an id that isn't an organization, when it loses the snapshot write to concurrent writers four times in a row, and inside a transaction.
+
+## Inside a transaction
+
+Every method reads and writes through better-auth's `getCurrentAdapter`, so a call made inside your `runWithTransaction` uses that transaction. On an adapter without real transactions, every call counts as outside one, which is safe: there is nothing to wait on or roll back.
+
+| Call | Inside a transaction |
+|---|---|
+| `get`, `getMany`, `hasFeature`, `getLimit`, `checkCapacity` | Work. They may read the cache but never write it, never persist a snapshot (a missing one resolves without writing) and never schedule a refresh |
+| `consumeUsage`, `sync`, `refreshEntitlements` | Throw `[@byo-oss/entitlements] <name> must run outside a transaction`. Call them before or after it: a counter or snapshot create could abort your transaction, and a consumption rolled back with it would be invisible to others |
+| `setEntitlementOverride`, `removeEntitlementOverride`, `deleteOrganizationData` | Join the transaction and roll back with it |
+| `processEntitlementsSync`, `byo.sweep`, `sweepAll` | Join the transaction. See [Background work](/docs/entitlements/background#inside-a-transaction) |
+
+Events from a write that joined your transaction fire after it commits, and never if it rolls back.
+
+Join a transaction with `runWithTransaction` from `@better-auth/core/context`:
+
+```ts title="lib/create-project.ts"
+import { runWithTransaction } from "@better-auth/core/context";
+import { auth } from "./auth";
+import { gate } from "./gate";
+
+export async function createProject(organizationId: string, count: number) {
+  const ctx = await auth.$context;
+  return runWithTransaction(ctx.adapter, async () => {
+    const check = await gate.checkCapacity(organizationId, "projects", { count });
+    if (!check.allowed) return { ok: false as const, upgradeTo: check.upgradeTo };
+    // ...create the project through the same adapter
+    return { ok: true as const };
+  });
+}
+```

@@ -1,0 +1,121 @@
+---
+title: Overrides and access
+description: Let staff comp a feature, change a limit or move an organization to another plan, and how the staff organization, permissions and sessions decide who may read and override.
+group: guides
+order: 4
+---
+
+An override replaces one value for one organization: a feature, a limit or the whole plan. Staff set it with a reason and an optional expiry, and it is kept after it ends, as an audit trail. Overrides are checked in your staff organization, never in the organization being changed.
+
+## Kinds of override
+
+| `kind` | `key` | `value` | Effect |
+|---|---|---|---|
+| `plan` | a plan key (not an alias) | none | Puts the organization on that plan. `plan.source` reads `"override"` |
+| `feature` | a feature key | `true` or `false` | Turns the feature on or off |
+| `limit` | a limit key of any kind | a non-negative integer or `"unlimited"` | Sets the limit |
+
+An override replaces the plan's value rather than taking the larger, so staff can also restrict. Setting a new override for the same organization, kind and key marks the old one `removed`. An organization has at most one live plan override, whatever its key.
+
+Resolution runs in this order: the billing snapshot and `isEntitled`, then a plan override, then your `resolveEntitlements` hook, then feature and limit overrides. An override whose key has left the catalog is ignored.
+
+## Setting and removing
+
+From server code, with the staff member's session headers:
+
+```ts title="lib/staff.ts"
+import { auth } from "./auth";
+
+export async function compExports(headers: Headers, organizationId: string) {
+  const { override } = await auth.api.setEntitlementOverride({
+    headers,
+    body: {
+      organizationId,
+      kind: "feature",
+      key: "exports",
+      value: true,
+      reason: "Design partner, comped for 90 days",
+      expiresAt: new Date(Date.now() + 90 * 86_400_000),
+    },
+  });
+  return override.id;
+}
+
+export async function endOverride(headers: Headers, id: string) {
+  await auth.api.removeEntitlementOverride({ headers, body: { id } });
+}
+```
+
+From the browser, `authClient.entitlements.override.set(body)`, `.override.remove({ id })` and `.overrides({ query })` call the same endpoints.
+
+The rules, each answered with 400 `INVALID_OVERRIDE`:
+
+- `key` is in the catalog for its `kind` (a plan alias is not a plan key);
+- a `feature` value is a boolean, a `limit` value a non-negative integer or `"unlimited"`;
+- a `plan` override takes no `value` (leave it out; one sent anyway is ignored);
+- `expiresAt`, if given, is in the future;
+- `reason` is 1 to 500 characters after trimming.
+
+An organization that doesn't exist answers 404 `ORGANIZATION_NOT_FOUND`. Removing an override that is missing or no longer active answers 404 `OVERRIDE_NOT_FOUND`.
+
+An override past its `expiresAt` stops applying at once. The sweep later marks it `expired`. Expiry emits no event; setting and removing do (see [Events](/docs/entitlements/events)).
+
+## Listing
+
+`listEntitlementOverrides` (GET `/entitlements/overrides`) returns `{ overrides, nextCursor }`, newest first, 50 per page. Filter with `organizationId` and `status` (`active`, `removed` or `expired`), and pass `nextCursor` back as `cursor`. Each override carries `id`, `organizationId`, `status`, `kind`, `key`, the decoded `value`, `reason`, `expiresAt`, `endedAt`, `createdBy`, `removedBy` and `createdAt`.
+
+Overrides that share one `createdAt` page out correctly up to 250 rows; past that the next page answers 400 `INVALID_CURSOR`. Staff-written rows never come close.
+
+## The staff organization
+
+Pass your staff organization's id as `staffOrganizationId`. Its members whose role grants `entitlements:override` may set and remove overrides; those with `entitlements:read` may list them and read any organization's entitlements. Grant the actions in your roles, see [Quickstart](/docs/entitlements/quickstart#grant-the-entitlements-permissions).
+
+`entitlementsStatements` (from the root or from `@byo-oss/entitlements/client`) holds both actions:
+
+| Action | In a customer organization | In the staff organization |
+|---|---|---|
+| `read` | See this organization's plan, features, limits and usage | Read any organization's entitlements, and list overrides |
+| `override` | Nothing | Set and remove overrides |
+
+Without `staffOrganizationId` and without your own `authorize`, every override endpoint denies and boot logs one warning. An empty string fails boot.
+
+## Who may read
+
+For `getEntitlements` and `refreshEntitlements`:
+
+1. `authorize` in the target organization with `entitlements:read` (the caller is a member); if that fails, `authorize` in the staff organization (the caller is staff).
+2. Neither passes: 404 `ORGANIZATION_NOT_FOUND`, whether or not the organization exists.
+3. `acceptSession` runs; `false` answers 403 `SESSION_NOT_ACCEPTED`.
+4. On the staff path, the target organization must exist, else 404.
+
+The override endpoints always check the staff organization. A caller outside it gets the 404, never a 403, before any organization lookup.
+
+Staff callers of the read endpoints also get each applied override's `id`, `reason` and `createdBy`. Members get `kind`, `key` and `expiresAt` only.
+
+## authorize
+
+The default `authorize` looks up the caller's `member` row in the organization it is asked about and runs the organization plugin's `hasPermission` for that role, so your `ac`, roles and dynamic access control apply. It never looks at role names or at the session's active organization.
+
+Replace it with `authorize: ({ session, headers, organizationId, permissions }) => boolean | Promise<boolean>`. It is called with the target organization for member reads and with `staffOrganizationId` for staff calls. `permissions` is, for example, `{ entitlements: ["override"] }`.
+
+## acceptSession
+
+`acceptSession({ session, headers, kind, method, path })` runs after `authorize` passed. `kind` is `"member"` or `"staff"`. The default refuses an impersonated session (`session.session.impersonatedBy`) on staff calls and on every POST, and allows impersonated member reads.
+
+Refusing API-key and bearer callers on the override endpoints is your choice. A custom `acceptSession` replaces the default, so keep the impersonation rule and add yours. Match the override paths exactly rather than by prefix, so what the rule covers is on the page:
+
+```ts title="lib/accept-session.ts"
+import type { EntitlementsAcceptSession } from "@byo-oss/entitlements";
+
+export const acceptSession: EntitlementsAcceptSession = ({ session, kind, method, path, headers }) => {
+  // the default's rule: no impersonated sessions on staff calls or POSTs
+  if (session.session.impersonatedBy && (kind === "staff" || method === "POST")) return false;
+  // your own rule: no bearer or API-key callers on the override endpoints (the GET list included)
+  const bearer = headers?.get("authorization")?.startsWith("Bearer ");
+  const overridePaths = ["/entitlements/override/set", "/entitlements/override/remove", "/entitlements/overrides"];
+  if (overridePaths.includes(path) && (bearer || headers?.has("x-api-key"))) return false;
+  return true;
+};
+```
+
+The two GET endpoints are `/entitlements/get` and `/entitlements/overrides`; every other route is POST. List the two GETs if your app classifies requests by method, for example to let impersonated sessions read.

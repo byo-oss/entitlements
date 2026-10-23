@@ -1,0 +1,173 @@
+---
+title: Quickstart
+description: Write the catalog, add the plugin, grant the permissions, migrate, add the client plugin and make the first hasFeature call in an existing better-auth app.
+group: get started
+order: 2
+---
+
+This takes an existing better-auth app with organizations to its first gated feature, in five steps. Each step ends on a check. You need better-auth 1.7.7 or newer already set up with a database.
+
+## Install
+
+```sh
+npm install @byo-oss/entitlements
+```
+
+Requires Node 20 or newer, `better-auth` `^1.7.7`, `better-call` `^1.4.0`, `@better-auth/core` `^1.7.7` (at the same version as `better-auth`) and `zod` `^4.0.0`. better-auth already depends on `@better-auth/core` and zod 4, so npm and pnpm resolve them. Install them yourself when your package manager is strict about peers (Yarn). An app still on zod 3 has to move to zod 4 first. The better-auth `organization` plugin is required: every table references `organization`.
+
+Optional peers, each behind its own import so the root never loads them:
+
+| Package | Needed for |
+|---|---|
+| `@better-auth/stripe` (`^1.7.7`) | `@byo-oss/entitlements/stripe` |
+| `react` (>=18) | `@byo-oss/entitlements/react` |
+| `vitest` (>=3) | `@byo-oss/entitlements/testing` (ESM only) |
+
+The other entry points:
+
+| Import | What it holds |
+|---|---|
+| `@byo-oss/entitlements` | the plugin, `createEntitlements`, `deleteOrganizationData`, `exportEntitlementsData`, `entitlementsStatements`, the error codes and event types, and the types |
+| `@byo-oss/entitlements/catalog` | `defineEntitlements`, `upgradeTo` and the catalog types. Imports nothing, so a static site can use it |
+| `@byo-oss/entitlements/client` | the better-auth client plugin, plus the catalog helpers and `entitlementsStatements` |
+
+**In a monorepo,** keep the catalog in one shared `plans` package that imports only `@byo-oss/entitlements/catalog`, and have the server, the web app and the pricing site import that package. Add `@byo-oss/entitlements` to every package that imports it, `plans` included. A package that only imports `/catalog` still installs the peers: pnpm's `auto-install-peers` (on by default) covers it; with `auto-install-peers=false`, npm 6 or Yarn, list `better-auth`, `better-call`, `@better-auth/core` and `zod` in that package's dependencies.
+
+<Steps>
+
+### Write the catalog and add the plugin
+
+The catalog lists your features and limits, and what each plan sets for them:
+
+```ts title="lib/catalog.ts"
+import { defineEntitlements } from "@byo-oss/entitlements/catalog";
+
+export const catalog = defineEntitlements({
+  features: ["exports", "sso", "prioritySupport"],
+  limits: {
+    apiCalls: { kind: "metered", period: "day" }, // day | month (UTC) | billing (subscription period)
+    members: { kind: "capacity" }, // you supply the count
+    projects: { kind: "capacity" },
+    retentionDays: { kind: "value" }, // a plan setting, read with getLimit
+  },
+  plans: {
+    free: {
+      features: { exports: false, sso: false, prioritySupport: false },
+      limits: { apiCalls: 1_000, members: 5, projects: 3, retentionDays: 7 },
+      display: { name: "Free" },
+    },
+    pro: {
+      features: { exports: true, sso: false, prioritySupport: false },
+      limits: { apiCalls: 50_000, members: 50, projects: "unlimited", retentionDays: 90 },
+      display: { name: "Pro" },
+    },
+  },
+  defaultPlan: "free",
+  planAliases: { legacy: "pro" }, // an old plan key still in Stripe maps to its current plan
+});
+```
+
+`organization()` must come before `entitlements()`: migrations create tables in plugin order, and every entitlements table references `organization`. Pass the id of your staff organization, the one whose members may set overrides (see [Overrides](/docs/entitlements/overrides)):
+
+```ts title="lib/auth.ts"
+import { betterAuth } from "better-auth";
+import { organization } from "better-auth/plugins/organization";
+import { entitlements } from "@byo-oss/entitlements";
+import { catalog } from "./catalog";
+import { ac, roles } from "./permissions"; // step 2
+
+export const auth = betterAuth({
+  // ...your existing config
+  plugins: [
+    organization({ ac, roles }), // before entitlements()
+    entitlements({
+      catalog,
+      staffOrganizationId: process.env.STAFF_ORGANIZATION_ID,
+    }),
+  ],
+});
+```
+
+- With no `source`, every organization is on `defaultPlan` (plus overrides). Add `fromBetterAuthStripe()` when you take payments, see [Billing](/docs/entitlements/billing).
+- Where `entitlements()` sits relative to `stripe()` doesn't matter: a source connects in `init`. Only `organization()` has to come first.
+- Without the organization plugin, boot fails with `ORGANIZATION_PLUGIN_REQUIRED`. Without `staffOrganizationId` (or your own `authorize`), the override endpoints deny every call and boot logs one warning.
+- Never rename a plan key that has subscribers. Add a `planAliases` entry from the old key to the current plan instead.
+
+Done when the app typechecks. It boots after step 3: on a SQL schema better-auth checks at boot that its tables exist.
+
+### Grant the entitlements permissions
+
+Spread `entitlementsStatements` into your access control and give your roles `entitlements` actions:
+
+```ts title="lib/permissions.ts"
+import { createAccessControl } from "better-auth/plugins/access";
+import { adminAc, defaultStatements, memberAc, ownerAc } from "better-auth/plugins/organization/access";
+import { entitlementsStatements } from "@byo-oss/entitlements";
+
+export const ac = createAccessControl({ ...defaultStatements, ...entitlementsStatements });
+
+export const roles = {
+  owner: ac.newRole({ ...ownerAc.statements, entitlements: ["read", "override"] }),
+  admin: ac.newRole({ ...adminAc.statements, entitlements: ["read", "override"] }),
+  member: ac.newRole({ ...memberAc.statements, entitlements: ["read"] }),
+};
+```
+
+- `entitlements:read` lets a member see their own organization's plan, features, limits and usage.
+- `entitlements:override` is only ever checked in the staff organization, never in the organization being changed. A customer organization's owner holds the action but isn't a member of the staff organization, so they can't override their own plan.
+
+Done when `ac` includes `entitlements` and the roles typecheck.
+
+### Run the migration
+
+The plugin declares its tables; your existing better-auth workflow creates them:
+
+```sh
+npx @better-auth/cli migrate
+```
+
+Use `generate` instead of `migrate` for drizzle or prisma. It adds `entitlementSnapshot`, `entitlementOverride` and `entitlementUsage`, and changes nothing on better-auth's own tables. On MongoDB, create the two unique indexes in [Schema](/docs/entitlements/schema#mongodb) first. Done when the migration is applied to the dev database.
+
+### Add the client plugin
+
+```ts title="lib/auth-client.ts"
+import { createAuthClient } from "better-auth/react";
+import { organizationClient } from "better-auth/client/plugins";
+import { entitlementsClient } from "@byo-oss/entitlements/client";
+
+export const authClient = createAuthClient({
+  plugins: [organizationClient(), entitlementsClient()],
+});
+```
+
+Done when `authClient.entitlements.get` typechecks.
+
+### Make the first check
+
+`createEntitlements` gives you the server API, typed by your catalog. Keep it in server code:
+
+```ts title="lib/gate.ts"
+import { createEntitlements } from "@byo-oss/entitlements";
+import { auth } from "./auth";
+import { catalog } from "./catalog";
+
+export const gate = createEntitlements(auth, catalog);
+
+export async function canExport(organizationId: string) {
+  return gate.hasFeature(organizationId, "exports");
+  // { allowed: false, reason: "not_in_plan", key: "exports", plan: "free", upgradeTo: ["pro"] }
+}
+```
+
+`"exprts"` is a type error. Done when a Free organization gets `allowed: false` with `upgradeTo: ["pro"]`.
+
+</Steps>
+
+## Next
+
+- [Checks](/docs/entitlements/checks) covers limits, usage and capacity.
+- [Billing](/docs/entitlements/billing) connects Stripe.
+- [React](/docs/entitlements/react) gates the UI and shows usage.
+- [Background work](/docs/entitlements/background) sets up the sweep, which you need once there is a billing source.
+
+For a complete, runnable wiring, see the example app in [`examples/tanstack-start`](https://github.com/byo-oss/entitlements/tree/main/examples/tanstack-start): TanStack Start with better-auth on SQLite and an end-to-end suite. Run it with `pnpm install`, `pnpm migrate`, `pnpm seed` and `pnpm dev` from that directory (Node 22.13 or newer). Its README has the details and the sign-ins.
