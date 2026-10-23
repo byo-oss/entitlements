@@ -73,6 +73,42 @@ For seats, count members, plus pending invitations when they hold a seat. Skip e
 
 `display` is free-form metadata, returned as given: names, taglines, highlight flags. Each plan keeps its own `display` type, so a pricing page reads `catalog.plans.team.display.name` typed. Prices are not part of the catalog: they live in Stripe.
 
+<Next>
+
+### One display shape for every plan
+
+To give every plan the same `display` fields, pass an interface as a type argument to a zero-argument call: `defineEntitlements<PlanCopy>()({ ... })`. Each plan's `display` must be assignable to the interface. A required key has to be there, a top-level key the interface doesn't name is an error, and a wrong type is an error. Each plan keeps its own literal types, so `display.support` stays `"Priority"`, and a `readonly string[]` field takes `["a", "b"]` inline. The call is curried because TypeScript can't infer the catalog's types when only some type arguments are given, so the shape is fixed first. The one-call form above is unchanged, and `defineEntitlements()({ ... })` with no type argument behaves like it.
+
+```ts title="lib/plan-copy.ts"
+import { defineEntitlements } from "@byo-oss/entitlements/catalog";
+
+export interface PlanCopy {
+  readonly name: string;
+  readonly support: "Community" | "Priority";
+  readonly items: readonly string[];
+}
+
+export const catalog = defineEntitlements<PlanCopy>()({
+  features: ["sso"],
+  limits: { seats: { kind: "capacity" } },
+  plans: {
+    free: {
+      features: { sso: false },
+      limits: { seats: 3 },
+      display: { name: "Free", support: "Community", items: ["3 seats"] },
+    },
+    pro: {
+      features: { sso: true },
+      limits: { seats: 25 },
+      display: { name: "Pro", support: "Priority", items: ["25 seats", "SSO"] },
+    },
+  },
+  defaultPlan: "free",
+});
+```
+
+</Next>
+
 ## Upgrade targets
 
 `upgradeTo` returns the plan keys, in catalog order, that include a feature or have at least a given amount of a limit (`"unlimited"` counts):

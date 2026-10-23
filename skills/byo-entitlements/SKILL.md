@@ -30,6 +30,8 @@ Work through these in order. Each step ends on a check; move on only when it hol
    })
    ```
 
+   From 0.2.0, optionally: `defineEntitlements<PlanCopy>()({ ... })` takes an interface as its type argument, and every plan's `display` must be assignable to it (a required key must be there; a top-level key the interface doesn't name is an error). Each plan keeps its own literal types, and `items: ["a"]` works for a `readonly string[]` field. The one-call form is unchanged.
+
 2. **Statements into `ac`.** Spread `entitlementsStatements` into `createAccessControl({ ...defaultStatements, ...entitlementsStatements })`, give roles `entitlements: ["read"]` (members) or `["read", "override"]` (owner, admin), and pass `ac` and `roles` to `organization()`. `override` is only ever checked in the staff organization, so a customer organization's owner cannot override their own plan. Done when the roles typecheck.
 
 3. **Migration.** Generate tables the way the repo already does: `npx @better-auth/cli migrate`, or `npx @better-auth/cli generate` and then the repo's drizzle or prisma flow. It adds `entitlementSnapshot`, `entitlementOverride` and `entitlementUsage`, with nothing on better-auth's own tables. On MongoDB, create unique indexes on `entitlementSnapshot.organizationId` and `entitlementUsage.bucket` first. Done when the migration is written and applied to the dev database.

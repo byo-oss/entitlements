@@ -3,4 +3,4 @@ allowBuilds:
 minimumReleaseAgeExclude:
   - "@byo-oss/*"
 overrides:
-  "@byo-oss/entitlements": "file:./.tarballs/byo-oss-entitlements-0.1.0.tgz"
+  "@byo-oss/entitlements": "file:./.tarballs/byo-oss-entitlements-0.2.0.tgz"

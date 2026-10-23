@@ -46,7 +46,7 @@ export async function exportProjects(organizationId: string): Promise<Response> 
 
 ## Limits and usage
 
-`consumeUsage` counts against a metered limit. It is one `incrementOne` guarded on `used <= limit - amount`, so the count and the limit check happen in one statement, and a refused call never counts. This guard sets the `ratelimit-*` headers on every call:
+`consumeUsage` counts against a metered limit. It is one `incrementOne` guarded on `used <= limit - amount`, so the count and the limit check happen in one statement, and a refused call never counts. On an `"unlimited"` limit it still counts, one write per call (plus the counter's create on a period's first call), so `used` keeps growing for reports. The catalog's plan alone doesn't say whether a key is unlimited: an override or `resolveEntitlements` can lift or lower a cap, and `get(organizationId).limits[key]` is the resolved value. This guard sets the `ratelimit-*` headers on every call that has a numeric limit:
 
 ```ts title="lib/guard.ts"
 import { gate } from "./gate";
@@ -67,6 +67,7 @@ export async function guardApiCall(organizationId: string, headers: Headers): Pr
 }
 ```
 
+- An `"unlimited"` key (from the plan, an override or `resolveEntitlements`) reports `limit` and `remaining` as the string `"unlimited"`, not a number. Don't put a large number in their place (such as `Number.MAX_SAFE_INTEGER`) for headers, API fields or progress bars: send or show the pair only when both are numbers, and show "unlimited" otherwise.
 - `resetAt` is when the current period ends and the counter starts again.
 - `firstRefusal` is true for the first refusal of the key in its period. That refusal also emits `entitlements.usage.limit_reached` (see [Events](/docs/entitlements/events)).
 - `getLimit` reads a limit of any kind without consuming. On a metered key it answers `limit_reached` when nothing is left.

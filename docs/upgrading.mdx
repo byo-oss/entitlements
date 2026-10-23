@@ -7,6 +7,14 @@ order: 3
 
 Each section covers one release, newest first. Read the sections between your current version and the latest. The docs describe the latest published release.
 
+<Next>
+
+## 0.2.0
+
+Additive: nothing to change in your code when you move up from 0.1.0. Before 1.0 a caret range doesn't cross minors, so widen `^0.1.0` to `^0.2.0`. The new curried form, `defineEntitlements<PlanCopy>()({ ... })`, which checks every plan's `display` against one interface, is optional; see [Catalog](/docs/entitlements/catalog). The docs also now say how `deleteOrganizationData` behaves on SQL, that an `"unlimited"` limit reports `"unlimited"` rather than a number, and that `consumeUsage` counts on an unlimited limit.
+
+</Next>
+
 ## 0.1.0
 
 The first release. There is nothing to upgrade from: follow the [Quickstart](/docs/entitlements/quickstart). It needs `better-auth` 1.7.7 or newer, `better-call` 1.4 or newer, `@better-auth/core` at the same version as `better-auth`, and zod 4.

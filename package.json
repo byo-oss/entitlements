@@ -1,6 +1,6 @@
 {
   "name": "@byo-oss/entitlements",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A better-auth plugin for plan entitlements: features, limits and usage per organization, in your own database.",
   "license": "MIT",
   "author": "Jarod Stewart",

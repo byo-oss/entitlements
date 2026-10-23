@@ -14,7 +14,9 @@ import {
   type PlanKey,
   upgradeTo,
 } from "./catalog";
+import { entitlements } from "./index";
 import type { UsageMeterProps } from "./react/usage-meter";
+import { fromBetterAuthStripe } from "./stripe";
 import type {
   EntitlementsResponseOverride,
   EntitlementsResult,
@@ -336,3 +338,266 @@ assertType<Equal<ResolvedState["error"], unknown>>();
 assertType<
   Equal<UsageMeterProps<typeof catalog>["catalog"], typeof catalog | undefined>
 >();
+
+// ---------------------------------------------------------------------------
+// A shared display shape: defineEntitlements<D>()({...}) (0.2.0)
+// ---------------------------------------------------------------------------
+
+// the app's copy for a plan: one display shape that every plan is checked
+// against (curried form: defineEntitlements<D>()({...}))
+interface ShapedCopy {
+  readonly name: string;
+  readonly support: "Community" | "Priority";
+  readonly items: readonly string[];
+}
+
+// T1: every plan matches the shape; each plan keeps its own literal types
+const shapedCatalog = defineEntitlements<ShapedCopy>()({
+  features: ["sso"],
+  limits: { seats: { kind: "capacity" } },
+  plans: {
+    free: {
+      features: { sso: false },
+      limits: { seats: 3 },
+      display: { name: "Free", support: "Community", items: ["3 seats"] },
+    },
+    pro: {
+      features: { sso: true },
+      limits: { seats: 25 },
+      display: { name: "Pro", support: "Priority", items: ["25 seats"] },
+    },
+  },
+  defaultPlan: "free",
+});
+assertType<Equal<typeof shapedCatalog.plans.pro.display.support, "Priority">>();
+assertType<
+  Equal<typeof shapedCatalog.plans.free.display.support, "Community">
+>();
+assertType<Equal<typeof shapedCatalog.plans.pro.display.name, "Pro">>();
+assertType<Equal<PlanKey<typeof shapedCatalog>, "free" | "pro">>();
+
+// T2: a plan whose display is missing a required key of the shape. Each
+// directive sits on the line the error is reported on (the key that holds
+// the incomplete object).
+export function shapedMissingKeys() {
+  defineEntitlements<ShapedCopy>()({
+    features: ["sso"],
+    limits: { seats: { kind: "capacity" } },
+    plans: {
+      free: {
+        features: { sso: false },
+        limits: { seats: 3 },
+        // @ts-expect-error free's display has no "support"
+        display: { name: "Free", items: ["3 seats"] },
+      },
+    },
+    defaultPlan: "free",
+  });
+
+  // a plan with no display at all, where the shape requires one
+  defineEntitlements<ShapedCopy>()({
+    features: ["sso"],
+    limits: { seats: { kind: "capacity" } },
+    plans: {
+      // @ts-expect-error free has no display, and the shape needs one
+      free: { features: { sso: false }, limits: { seats: 3 } },
+    },
+    defaultPlan: "free",
+  });
+}
+
+// contract 2: when every key of the shape is optional, display is optional too
+// (no row of its own; a plan without display still compiles)
+interface ShapedOptionalCopy {
+  readonly name?: string;
+  readonly support?: "Community" | "Priority";
+}
+const shapedOptional = defineEntitlements<ShapedOptionalCopy>()({
+  features: ["sso"],
+  limits: { seats: { kind: "capacity" } },
+  plans: {
+    free: { features: { sso: false }, limits: { seats: 3 } },
+    pro: {
+      features: { sso: true },
+      limits: { seats: 25 },
+      display: { name: "Pro" },
+    },
+  },
+  defaultPlan: "free",
+});
+void shapedOptional;
+
+// T3: a wrong-typed field, and an unknown key (the shape is a closed
+// interface). Each negative case is its own statement.
+export function shapedWrongFieldAndUnknownKey() {
+  defineEntitlements<ShapedCopy>()({
+    features: ["sso"],
+    limits: { seats: { kind: "capacity" } },
+    plans: {
+      free: {
+        features: { sso: false },
+        limits: { seats: 3 },
+        // @ts-expect-error name must be a string (every field of the display
+        // reports, so the display sits on one line)
+        display: { name: 3, support: "Community", items: ["3 seats"] },
+      },
+    },
+    defaultPlan: "free",
+  });
+
+  defineEntitlements<ShapedCopy>()({
+    features: ["sso"],
+    limits: { seats: { kind: "capacity" } },
+    plans: {
+      free: {
+        features: { sso: false },
+        limits: { seats: 3 },
+        display: {
+          name: "Free",
+          support: "Community",
+          items: ["3 seats"],
+          // @ts-expect-error "tagline" is not a field of the shape
+          tagline: "For teams",
+        },
+      },
+    },
+    defaultPlan: "free",
+  });
+}
+
+// T4: an inline array is accepted for a readonly string[] field (A3), and the
+// plan's display items are usable as readonly string[]
+const shapedTwoItems = defineEntitlements<ShapedCopy>()({
+  features: ["sso"],
+  limits: { seats: { kind: "capacity" } },
+  plans: {
+    free: {
+      features: { sso: false },
+      limits: { seats: 3 },
+      display: { name: "Free", support: "Community", items: ["a", "b"] },
+    },
+    pro: {
+      features: { sso: true },
+      limits: { seats: 25 },
+      display: { name: "Pro", support: "Priority", items: ["c"] },
+    },
+  },
+  defaultPlan: "free",
+});
+const shapedProItems: readonly string[] = shapedCatalog.plans.pro.display.items;
+const shapedFreeItems: readonly string[] =
+  shapedTwoItems.plans.free.display.items;
+void shapedProItems;
+void shapedFreeItems;
+
+// T5: the one-argument form is unchanged. Its display stays free-form, so a
+// plan's display may carry any keys. The other one-argument rows are the
+// existing ones above (displayTypes: the plan without display, and
+// `plan.display?.name` over every plan), reused by reference, not repeated.
+const shapedPlainFree = defineEntitlements({
+  features: ["exports"],
+  limits: { apiCalls: { kind: "metered", period: "day" } },
+  plans: {
+    free: {
+      features: { exports: false },
+      limits: { apiCalls: 1 },
+      display: { anything: 1, nested: { deep: true } },
+    },
+  },
+  defaultPlan: "free",
+});
+assertType<Equal<typeof shapedPlainFree.plans.free.display.anything, 1>>();
+assertType<
+  Equal<typeof shapedPlainFree.plans.free.display.nested.deep, true>
+>();
+
+// T6: the shaped catalog goes wherever a catalog goes, with no cast
+export function shapedHandoffs() {
+  const shared = createEntitlements(auth, shapedCatalog);
+  const plugin = entitlements({
+    catalog: shapedCatalog,
+    source: fromBetterAuthStripe(),
+  });
+  const wide: AnyCatalog = shapedCatalog;
+  const typed: Catalog = shapedCatalog;
+  void [shared, plugin, wide, typed];
+}
+
+// An optional-only shape still closes the top-level keys
+export function shapedOptionalUnknownKey() {
+  defineEntitlements<ShapedOptionalCopy>()({
+    features: ["sso"],
+    limits: { seats: { kind: "capacity" } },
+    plans: {
+      free: {
+        features: { sso: false },
+        limits: { seats: 3 },
+        // @ts-expect-error tagline is not a key of ShapedOptionalCopy
+        display: { name: "Free", tagline: "x" },
+      },
+    },
+    defaultPlan: "free",
+  });
+}
+
+// A shape with an index signature and a required key still requires `display`
+interface ShapedIndexedCopy {
+  readonly name: string;
+  readonly [key: string]: unknown;
+}
+export function shapedIndexedStillRequiresDisplay() {
+  defineEntitlements<ShapedIndexedCopy>()({
+    features: ["sso"],
+    limits: { seats: { kind: "capacity" } },
+    plans: {
+      // @ts-expect-error display is required: the shape has a required key
+      free: { features: { sso: false }, limits: { seats: 3 } },
+    },
+    defaultPlan: "free",
+  });
+}
+
+// A union shape accepts the keys of any member
+type ShapedUnionCopy =
+  | { readonly tier: "free"; readonly name: string }
+  | {
+      readonly tier: "paid";
+      readonly name: string;
+      readonly price: string;
+    };
+const shapedUnion = defineEntitlements<ShapedUnionCopy>()({
+  features: ["sso"],
+  limits: { seats: { kind: "capacity" } },
+  plans: {
+    free: {
+      features: { sso: false },
+      limits: { seats: 3 },
+      display: { tier: "free", name: "Free" },
+    },
+    pro: {
+      features: { sso: true },
+      limits: { seats: 25 },
+      display: { tier: "paid", name: "Pro", price: "$10" },
+    },
+  },
+  defaultPlan: "free",
+});
+void shapedUnion;
+
+// No type argument: the same as the one-call form (any display keys)
+const shapedNoTypeArgument = defineEntitlements()({
+  features: ["sso"],
+  limits: { seats: { kind: "capacity" } },
+  plans: {
+    free: {
+      features: { sso: false },
+      limits: { seats: 3 },
+      display: { anything: 1 },
+    },
+  },
+  defaultPlan: "free",
+});
+assertType<Equal<typeof shapedNoTypeArgument.plans.free.display.anything, 1>>();
+
+// ReturnType and Parameters of the one-call form are unchanged by the overload
+assertType<Equal<Parameters<typeof defineEntitlements>["length"], 1>>();
