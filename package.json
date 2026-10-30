@@ -76,7 +76,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/byo-oss/entitlements"
+    "url": "git+https://github.com/byo-oss/entitlements.git"
   },
   "homepage": "https://github.com/byo-oss/entitlements#readme",
   "publishConfig": {
