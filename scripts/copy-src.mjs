@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * Prepares the floor lane: copies `src/` to `tests/min/src/` so the same
- * tests run against the pinned 1.7.7 set. Files that carry the line
+ * tests run against the pinned 1.7.16 set. Files that carry the line
  * `// lane: latest-only` are skipped. Every better-auth import in the copy
  * must resolve to a package pinned in `tests/min/package.json`; otherwise the
  * lane would silently load the root's newer copy.
@@ -136,7 +136,7 @@ function selfTest() {
     writeFileSync(
       join(root, "tests", "min", "package.json"),
       JSON.stringify({
-        devDependencies: { "better-auth": "1.7.7", vitest: "4" },
+        devDependencies: { "better-auth": "1.7.16", vitest: "4" },
       }),
     );
     for (const [rel, text] of Object.entries(files)) {

@@ -81,7 +81,7 @@ How exact the guard is depends on the adapter:
 | Memory, Prisma, MongoDB | Native guarded increment: exact |
 | A custom adapter without its own `incrementOne` | better-auth's fallback guards on the prior value and retries 5 times, then throws. Under contention `consumeUsage` answers `onError` (deny by default) rather than over-allowing |
 
-better-auth before 1.7.7 guards only a subquery on Postgres, which is why the peer floor is `^1.7.7`.
+better-auth before 1.7.7 guards only a subquery on Postgres, which is why the peer floor was `^1.7.7`. It is now `^1.7.16`, because of the 2026-11-03 security release.
 
 ## Capacity
 

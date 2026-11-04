@@ -1,6 +1,6 @@
 {
   "name": "@byo-oss/entitlements",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A better-auth plugin for plan entitlements: features, limits and usage per organization, in your own database.",
   "license": "MIT",
   "author": "Jarod Stewart",
@@ -83,10 +83,10 @@
     "access": "public"
   },
   "peerDependencies": {
-    "@better-auth/core": "^1.7.7",
-    "@better-auth/stripe": "^1.7.7",
-    "better-auth": "^1.7.7",
-    "better-call": "^1.4.0",
+    "@better-auth/core": "^1.7.16",
+    "@better-auth/stripe": "^1.7.16",
+    "better-auth": "^1.7.16",
+    "better-call": "^1.4.5",
     "react": ">=18",
     "vitest": ">=3",
     "zod": "^4.0.0"

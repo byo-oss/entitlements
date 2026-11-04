@@ -7,7 +7,7 @@ description: Plan entitlements for better-auth apps with @byo-oss/entitlements. 
 
 A better-auth plugin: a typed catalog of plans, features and limits, a per-organization snapshot of the billing state, atomic usage counters and staff overrides, all in the app's own database. Stripe (through `@better-auth/stripe`) says which plan an organization bought; the catalog says what it allows.
 
-The API reference is `node_modules/@byo-oss/entitlements/llms.txt` once the package is installed. Read it before writing calls; this skill covers wiring and the gotchas. Requires `better-auth` `^1.7.7` and the organization plugin. Required peers: `better-auth` `^1.7.7`, `better-call` `^1.4.0`, `@better-auth/core` `^1.7.7` (same version as `better-auth`) and `zod` `^4.0.0`.
+The API reference is `node_modules/@byo-oss/entitlements/llms.txt` once the package is installed. Read it before writing calls; this skill covers wiring and the gotchas. Requires `better-auth` `^1.7.16` and the organization plugin. Required peers: `better-auth` `^1.7.16`, `better-call` `^1.4.5`, `@better-auth/core` `^1.7.16` (same version as `better-auth`) and `zod` `^4.0.0`.
 
 ## Setup
 

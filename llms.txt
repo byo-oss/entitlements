@@ -1,6 +1,6 @@
 # @byo-oss/entitlements
 
-Plan entitlements as a better-auth plugin. A typed catalog of plans, features and limits; per-organization snapshot of the billing state, atomic usage counters and staff overrides, all in the app's own database (any better-auth adapter). Requires better-auth ^1.7.7 and the organization plugin. Required peers: better-auth ^1.7.7, better-call ^1.4.0, @better-auth/core ^1.7.7 (same version as better-auth) and zod ^4.0.0; better-auth already depends on core and zod 4, so add them yourself only on a strict package manager. A package that imports only @byo-oss/entitlements/catalog (a static site, a shared plans package in a monorepo) still installs these peers: pnpm's auto-install-peers (the default) covers it, otherwise list them in that package. Organizations only: no user-scoped subscriptions.
+Plan entitlements as a better-auth plugin. A typed catalog of plans, features and limits; per-organization snapshot of the billing state, atomic usage counters and staff overrides, all in the app's own database (any better-auth adapter). Requires better-auth ^1.7.16 and the organization plugin. Required peers: better-auth ^1.7.16, better-call ^1.4.5, @better-auth/core ^1.7.16 (same version as better-auth) and zod ^4.0.0; better-auth already depends on core and zod 4, so add them yourself only on a strict package manager. A package that imports only @byo-oss/entitlements/catalog (a static site, a shared plans package in a monorepo) still installs these peers: pnpm's auto-install-peers (the default) covers it, otherwise list them in that package. Organizations only: no user-scoped subscriptions.
 
 ## Install & wire
 
@@ -199,7 +199,7 @@ Overrides replace the plan's value (they can restrict). One live plan override p
 
 ```ts
 // lib/auth-stripe.ts
-// needs @better-auth/stripe ^1.7.7 with subscription.enabled and organization.enabled
+// needs @better-auth/stripe ^1.7.16 with subscription.enabled and organization.enabled
 import Stripe from "stripe"
 import { betterAuth } from "better-auth"
 import { organization } from "better-auth/plugins/organization"
@@ -308,7 +308,7 @@ testBillingSource({
 - The sweep claims due snapshots with a lease, resolves, backs off 1 min doubling (cap maxAge), marks overrides past expiresAt "expired", prunes usage (usageRetention) and ended overrides (overrideRetention). After maxAttempts a snapshot counts failed, keeps its last good state and retries at maxAge. Without a source only expiry and pruning run. @byo-oss/core's sweepAll(auth) runs it with the other BYO plugins.
 - Delivery: sweeps are at-least-once. A lease that expires (leaseMs) while a slow sweep is still working lets a second sweep claim the same row and both resync it; harmless, because a resync writes absolute state. Syncs write absolute state; events are best-effort, at most once, in-process.
 - Staleness across processes: each process caches up to cacheTtlMs (30s); it clears its own entry on its own writes and on invalidate(). Another process's write can show up cacheTtlMs late. refreshEntitlements returns the latest state: a lost concurrent write is retried up to 3 times, then it answers 503 ENTITLEMENTS_UNAVAILABLE (a Stripe push that loses the same way answers 400, so Stripe redelivers). Usage counters are never cached.
-- incrementOne atomicity: Kysely/Drizzle re-apply the guard on the UPDATE from better-auth 1.7.7 (exact); memory, Prisma, MongoDB native (exact); a custom adapter without incrementOne uses core's fallback (prior-value guard, 5 tries, then throws → onError denies under contention).
+- incrementOne atomicity: Kysely/Drizzle re-apply the guard on the UPDATE (exact; before better-auth 1.7.7 only a subquery on Postgres, hence the old ^1.7.7 floor, now ^1.7.16 for the 2026-11-03 security release); memory, Prisma, MongoDB native (exact); a custom adapter without incrementOne uses core's fallback (prior-value guard, 5 tries, then throws → onError denies under contention).
 
 ```ts
 // scripts/cron.ts (server only; run every minute)

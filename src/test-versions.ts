@@ -1,6 +1,6 @@
 /**
  * Proves a lane loaded the better-auth set it claims to. Every lane runs the
- * same tests against a different install (latest at the root, the 1.7.7 floor
+ * same tests against a different install (latest at the root, the 1.7.16 floor
  * in `tests/min`), so each version test starts here: a lane that resolved the
  * wrong packages fails loudly instead of passing for the wrong reason.
  */

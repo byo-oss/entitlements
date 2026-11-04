@@ -5,7 +5,7 @@ group: get started
 order: 2
 ---
 
-This takes an existing better-auth app with organizations to its first gated feature, in five steps. Each step ends on a check. You need better-auth 1.7.7 or newer already set up with a database.
+This takes an existing better-auth app with organizations to its first gated feature, in five steps. Each step ends on a check. You need better-auth 1.7.16 or newer already set up with a database.
 
 ## Install
 
@@ -13,13 +13,13 @@ This takes an existing better-auth app with organizations to its first gated fea
 npm install @byo-oss/entitlements
 ```
 
-Requires Node 20 or newer, `better-auth` `^1.7.7`, `better-call` `^1.4.0`, `@better-auth/core` `^1.7.7` (at the same version as `better-auth`) and `zod` `^4.0.0`. better-auth already depends on `@better-auth/core` and zod 4, so npm and pnpm resolve them. Install them yourself when your package manager is strict about peers (Yarn). An app still on zod 3 has to move to zod 4 first. The better-auth `organization` plugin is required: every table references `organization`.
+Requires Node 20 or newer, `better-auth` `^1.7.16`, `better-call` `^1.4.5`, `@better-auth/core` `^1.7.16` (at the same version as `better-auth`) and `zod` `^4.0.0`. better-auth already depends on `@better-auth/core` and zod 4, so npm and pnpm resolve them. Install them yourself when your package manager is strict about peers (Yarn). An app still on zod 3 has to move to zod 4 first. The better-auth `organization` plugin is required: every table references `organization`.
 
 Optional peers, each behind its own import so the root never loads them:
 
 | Package | Needed for |
 |---|---|
-| `@better-auth/stripe` (`^1.7.7`) | `@byo-oss/entitlements/stripe` |
+| `@better-auth/stripe` (`^1.7.16`) | `@byo-oss/entitlements/stripe` |
 | `react` (>=18) | `@byo-oss/entitlements/react` |
 | `vitest` (>=3) | `@byo-oss/entitlements/testing` (ESM only) |
 

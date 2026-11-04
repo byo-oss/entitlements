@@ -7,13 +7,18 @@ order: 3
 
 Each section covers one release, newest first. Read the sections between your current version and the latest. The docs describe the latest published release.
 
-<Next>
+## 0.3.0
+
+Raises the peer floor; no migration and no API change. `better-auth` and `@better-auth/core` are now `^1.7.16`, optional `@better-auth/stripe` is `^1.7.16`, and `better-call` is `^1.4.5` (better-auth 1.7.16 pins it exactly), because 1.7.16 is the [2026-11-03 security release](https://better-auth.com/blog/security-release-2026-11-03). Before 1.0 a caret range doesn't cross minors, so widen `^0.2.0` to `^0.3.0`.
+
+To upgrade, move `better-auth` and every `@better-auth/*` package together to 1.7.16 or later, before or with this package. Two fixes in that release touch what this package relies on:
+
+- **Stripe (GHSA-x8j7-xh58-rv6x), if you use `@byo-oss/entitlements/stripe`.** A user could point their customer ID at another customer's Stripe account. In 1.7.16 `@better-auth/stripe` no longer lets sign-up or `updateUser` set customer or subscription fields, including server-side `auth.api.updateUser`. Entitlements only reads them, so nothing changes here; if your own code writes those fields through `updateUser`, write them through the adapter instead.
+- **Organization roles (GHSA-c85h-5mrr-mgx4).** An admin could invite an account as an owner with a padded role name such as `" owner"`. better-auth now trims role lists and splits them on commas wherever it stores or compares them, and rejects an invitation with an empty role. Staff checks run `hasPermission` in `staffOrganizationId`, so a padded role could have made an account a staff owner there. Audit that organization's members and invitations for role values that change when trimmed, and don't trim them in place: trimming `admin, owner` makes the member a real owner.
 
 ## 0.2.0
 
 Additive: nothing to change in your code when you move up from 0.1.0. Before 1.0 a caret range doesn't cross minors, so widen `^0.1.0` to `^0.2.0`. The new curried form, `defineEntitlements<PlanCopy>()({ ... })`, which checks every plan's `display` against one interface, is optional; see [Catalog](/docs/entitlements/catalog). The docs also now say how `deleteOrganizationData` behaves on SQL, that an `"unlimited"` limit reports `"unlimited"` rather than a number, and that `consumeUsage` counts on an unlimited limit.
-
-</Next>
 
 ## 0.1.0
 

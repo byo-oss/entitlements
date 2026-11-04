@@ -20,7 +20,7 @@ npm install @byo-oss/entitlements
 npm install @byo-oss/entitlements
 ```
 
-Required peer dependencies: `better-auth` `^1.7.7`, `better-call` `^1.4.0`, `@better-auth/core` `^1.7.7` (at the same version as `better-auth`) and `zod` `^4.0.0`. better-auth already depends on `@better-auth/core` and zod 4, so npm and pnpm resolve them; install them yourself when your package manager is strict about peers (Yarn). An app still on zod 3 has to move to zod 4 first. A package that only imports `@byo-oss/entitlements/catalog` (a static site, a shared plans package in a monorepo) still installs the package's peers, even though the catalog code imports nothing. With pnpm, `auto-install-peers` (on by default) installs them; with `auto-install-peers=false`, npm 6 or Yarn, list `better-auth`, `better-call`, `@better-auth/core` and `zod` in that package's dependencies. Optional peers: `@better-auth/stripe` `^1.7.7` (for `@byo-oss/entitlements/stripe`), `react` (for `/react`) and `vitest` (for `/testing`).
+Required peer dependencies: `better-auth` `^1.7.16`, `better-call` `^1.4.5`, `@better-auth/core` `^1.7.16` (at the same version as `better-auth`) and `zod` `^4.0.0`. better-auth already depends on `@better-auth/core` and zod 4, so npm and pnpm resolve them; install them yourself when your package manager is strict about peers (Yarn). An app still on zod 3 has to move to zod 4 first. A package that only imports `@byo-oss/entitlements/catalog` (a static site, a shared plans package in a monorepo) still installs the package's peers, even though the catalog code imports nothing. With pnpm, `auto-install-peers` (on by default) installs them; with `auto-install-peers=false`, npm 6 or Yarn, list `better-auth`, `better-call`, `@better-auth/core` and `zod` in that package's dependencies. Optional peers: `@better-auth/stripe` `^1.7.16` (for `@byo-oss/entitlements/stripe`), `react` (for `/react`) and `vitest` (for `/testing`).
 
 | Subpath | What it holds |
 |---|---|
@@ -594,11 +594,11 @@ The billing provider is the source of truth; the snapshot is a cache of it. It i
 
 | Adapter | Guarantee |
 |---|---|
-| Kysely, Drizzle (better-auth 1.7.7 and later) | the guard is re-applied on the `UPDATE` itself: exact |
+| Kysely, Drizzle | the guard is re-applied on the `UPDATE` itself: exact |
 | Memory, Prisma, MongoDB | native guarded increment: exact |
 | A custom adapter without its own `incrementOne` | better-auth's fallback guards on the prior value and retries 5 times, then throws. Under contention `consumeUsage` answers `onError` (deny by default) rather than over-allowing |
 
-Earlier better-auth versions guard only a subquery on Postgres, which is why the peer floor is `^1.7.7`.
+better-auth before 1.7.7 guards only a subquery on Postgres, which is why the peer floor was `^1.7.7`. It is now `^1.7.16`, because of the 2026-11-03 security release.
 
 ## Inside a transaction
 

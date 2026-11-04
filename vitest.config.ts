@@ -13,7 +13,6 @@ export default defineConfig({
     ],
     env: {
       BYO_EXPECT_BA: "1.7.16",
-      BYO_ROOT_BA: "1.7.16",
     },
   },
 });

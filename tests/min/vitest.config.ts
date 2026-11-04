@@ -12,8 +12,7 @@ export default defineConfig({
       "**/*.dist.test.ts",
     ],
     env: {
-      BYO_EXPECT_BA: "1.7.7",
-      BYO_ROOT_BA: "1.7.16",
+      BYO_EXPECT_BA: "1.7.16",
     },
   },
 });
