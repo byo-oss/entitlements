@@ -9,7 +9,7 @@ export default defineConfig({
     hookTimeout: 30_000,
     env: {
       BYO_EXPECT_BA: "1.7.7",
-      BYO_ROOT_BA: "1.7.12",
+      BYO_ROOT_BA: "1.7.16",
     },
   },
 });
