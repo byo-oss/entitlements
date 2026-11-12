@@ -13,7 +13,7 @@ Raises three floors; no migration and no API change. Breaking under the conventi
 
 - **zod is now `^4.6.6`** (was `^4.0.0`), because zod 4.6.6 fixes GHSA-mrhx-c7xc-m3w5. An app on zod older than 4.6.6 (zod 3 included) has to move to 4.6.6 or later first, before or with this package.
 - **`@byo-oss/core` is now `^0.2.0`** (was `^0.1.0`). Core 0.2.0 only narrowed its `better-auth` peer to `^1.7.16`, which this package already requires. Moving to it stops an app that uses core 0.2.0 from installing a second copy of core.
-- **Optional peer `vitest` is now `>=4.1.11`** (was `>=3`), which drops vitest 3 for `@byo-oss/entitlements/testing`. This closes GHSA-5xrq-8626-4rwp (critical; affects below 3.2.6 and 4.0.x) and GHSA-82fw-gwwq-j7x9 (moderate; affects below 4.1.11). An app with vitest installed needs 4.1.11 or later even if it never imports `/testing` (npm stops with ERESOLVE).
+- **Optional peer `vitest` is now `^4.1.12 || >=5.0.3`** (was `>=3`), which drops vitest 3 for `@byo-oss/entitlements/testing`. This closes GHSA-5xrq-8626-4rwp (critical; affects below 3.2.6 and 4.0.x) and GHSA-82fw-gwwq-j7x9 (moderate; affects below the fixed 4.1 patch), and GHSA-qxg6-89mg-rqv8 and GHSA-xp26-3454-mjgp (both in `@vitest/mocker`, which vitest pins exactly; affect the 4.1 patch before 4.1.12 and 5.0.0 through 5.0.2, fixed in 4.1.12 and 5.0.3). An app on vitest 4 needs 4.1.12 or later, and an app on vitest 5 needs 5.0.3 or later, even if it never imports `/testing` (npm stops with ERESOLVE).
 
 ## 0.3.0
 
