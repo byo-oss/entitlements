@@ -233,14 +233,14 @@ function selfTest() {
   const pkg = {
     name: "@byo-oss/entitlements",
     exports: exportsMap,
-    dependencies: { "@byo-oss/core": "^0.1.0" },
+    dependencies: { "@byo-oss/core": "^0.2.0" },
     peerDependencies: {
       "@better-auth/core": "^1.7.16",
       "better-auth": "^1.7.16",
       "better-call": "^1.4.5",
       "@better-auth/stripe": "^1.7.16",
       react: ">=18",
-      zod: "^4.0.0",
+      zod: "^4.6.6",
     },
   };
   const clean = {
